@@ -91,3 +91,21 @@ MOD_PHASES = [
     "Build ISO",
     "Cleanup",
 ]
+
+# Standalone pipeline phase names (no dongle/chroot/compile)
+STANDALONE_PHASES = [
+    "Extract",
+    "Mount",
+    "Decrypt",
+    "Cleanup",
+]
+
+STANDALONE_MOD_PHASES = [
+    "Scan",
+    "Extract",
+    "Mount",
+    "Encrypt",
+    "Convert",
+    "Build ISO",
+    "Cleanup",
+]

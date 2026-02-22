@@ -9,7 +9,9 @@ from tkinter import messagebox
 
 from . import __version__
 from .gui import MainWindow
-from .pipeline import DecryptionPipeline, ModPipeline, check_prerequisites
+from .pipeline import (DecryptionPipeline, ModPipeline,
+                        StandaloneDecryptPipeline, StandaloneModPipeline,
+                        check_prerequisites)
 from .updater import check_for_update
 from .wsl import WslExecutor
 
@@ -163,7 +165,13 @@ class App:
                 elif isinstance(msg, PhaseMsg):
                     self.window.set_phase(msg.index, mode=self._active_mode)
                     from . import config
-                    phases = config.PHASES if self._active_mode == "decrypt" else config.MOD_PHASES
+                    phase_map = {
+                        "decrypt": config.PHASES,
+                        "modify": config.MOD_PHASES,
+                        "decrypt_standalone": config.STANDALONE_PHASES,
+                        "modify_standalone": config.STANDALONE_MOD_PHASES,
+                    }
+                    phases = phase_map.get(self._active_mode, config.PHASES)
                     if msg.index < len(phases):
                         self.window.set_status(f"{phases[msg.index]}...")
                 elif isinstance(msg, ProgressMsg):
@@ -204,7 +212,7 @@ class App:
         self.window.append_log("Checking prerequisites...", "info")
 
         def _run():
-            results = check_prerequisites(self.wsl)
+            results = check_prerequisites(self.wsl, standalone=True)
             for name, passed, message in results:
                 self.msg_queue.put(LogMsg(
                     f"  {name}: {'OK' if passed else 'MISSING'} - {message}",
@@ -237,6 +245,15 @@ class App:
 
     # --- Decrypt pipeline ---
 
+    def _find_fl_dat(self):
+        """Look for a cached fl_decrypted.dat in the output folder."""
+        output_path = self.window.output_var.get().strip()
+        if output_path:
+            fl_path = os.path.join(output_path, 'fl_decrypted.dat')
+            if os.path.isfile(fl_path):
+                return fl_path
+        return None
+
     def _start(self):
         """Start the decryption pipeline."""
         image_path = self.window.image_var.get().strip()
@@ -252,9 +269,13 @@ class App:
             return
 
         self._save_settings()
-        self._active_mode = "decrypt"
-        self.window.set_running(True, mode="decrypt")
-        self.window.reset_steps(mode="decrypt")
+
+        # Always use standalone mode — no dongle required
+        fl_dat_path = self._find_fl_dat()  # may be None (dongle-free scan)
+
+        self._active_mode = "decrypt_standalone"
+        self.window.set_running(True, mode=self._active_mode)
+        self.window.reset_steps(mode=self._active_mode)
 
         def log_cb(text, level="info"):
             self.msg_queue.put(LogMsg(text, level))
@@ -268,18 +289,24 @@ class App:
         def done_cb(success, summary):
             self.msg_queue.put(DoneMsg(success, summary))
 
-        self.pipeline = DecryptionPipeline(
-            image_path, output_path,
+        if fl_dat_path:
+            log_cb(f"Using cached file list: {fl_dat_path}", "success")
+        else:
+            log_cb("No cached file list found. Will scan filesystem "
+                   "and auto-detect filler sizes.", "info")
+        log_cb("No dongle, chroot, or gcc required.", "success")
+
+        self.pipeline = StandaloneDecryptPipeline(
+            image_path, output_path, fl_dat_path,
             log_cb, phase_cb, progress_cb, done_cb,
         )
-
-        # Intercept game detection for the GUI label
-        orig_chroot = self.pipeline._phase_chroot
-        def patched_chroot():
-            orig_chroot()
+        # Intercept game detection
+        orig_detect = self.pipeline._detect_game
+        def patched_detect():
+            orig_detect()
             if self.pipeline.game_name:
                 self.msg_queue.put(GameDetectedMsg(self.pipeline.game_name))
-        self.pipeline._phase_chroot = patched_chroot
+        self.pipeline._detect_game = patched_detect
 
         threading.Thread(target=self.pipeline.run, daemon=True).start()
 
@@ -328,9 +355,14 @@ class App:
                 return
 
         self._save_settings()
-        self._active_mode = "modify"
-        self.window.set_running(True, mode="modify")
-        self.window.reset_steps(mode="modify")
+
+        # Always use standalone mode — no dongle required
+        # Mod pipeline requires fl_decrypted.dat (needs CRC values for forgery)
+        fl_dat_path = self._find_fl_dat()
+
+        self._active_mode = "modify_standalone"
+        self.window.set_running(True, mode=self._active_mode)
+        self.window.reset_steps(mode=self._active_mode)
 
         def log_cb(text, level="info"):
             self.msg_queue.put(LogMsg(text, level))
@@ -344,20 +376,22 @@ class App:
         def done_cb(success, summary):
             self.msg_queue.put(DoneMsg(success, summary))
 
-        self.pipeline = ModPipeline(
-            image_path, output_path,
+        if not fl_dat_path:
+            messagebox.showerror(
+                "Missing File List",
+                "No fl_decrypted.dat found in the output folder.\n\n"
+                "Run Decrypt first to generate the file list, then try "
+                "Modify again.")
+            return
+
+        log_cb(f"Using cached file list: {fl_dat_path}", "success")
+        log_cb("No dongle, chroot, or gcc required.", "success")
+        self.pipeline = StandaloneModPipeline(
+            image_path, output_path, fl_dat_path,
             log_cb, phase_cb, progress_cb, done_cb,
         )
+
         self.pipeline.log_link = lambda text, url: self.msg_queue.put(LinkMsg(text, url))
-
-        # Intercept game detection
-        orig_chroot = self.pipeline._phase_chroot
-        def patched_chroot():
-            orig_chroot()
-            if self.pipeline.game_name:
-                self.msg_queue.put(GameDetectedMsg(self.pipeline.game_name))
-        self.pipeline._phase_chroot = patched_chroot
-
         threading.Thread(target=self.pipeline.run, daemon=True).start()
 
     def _mod_cancel(self):
@@ -372,13 +406,14 @@ class App:
         """Handle pipeline completion."""
         mode = self._active_mode
         self.window.set_running(False, mode=mode)
+        is_decrypt = mode in ("decrypt", "decrypt_standalone")
         if success:
             self.window.set_status("Complete!")
-            title = "Decryption Complete" if mode == "decrypt" else "Modification Complete"
+            title = "Decryption Complete" if is_decrypt else "Modification Complete"
             messagebox.showinfo(title, summary)
         else:
             self.window.set_status("Failed")
-            title = "Decryption Failed" if mode == "decrypt" else "Modification Failed"
+            title = "Decryption Failed" if is_decrypt else "Modification Failed"
             messagebox.showerror(title, summary)
 
     def _load_settings(self):

@@ -11,6 +11,118 @@ from .resources import DECRYPT_C_SOURCE, ENCRYPT_C_SOURCE, STUB_C_SOURCE
 from .wsl import WslError, WslExecutor, find_usbipd, win_to_wsl
 
 
+# Python script deployed to WSL for standalone decryption.
+# Placeholders are filled by StandaloneDecryptPipeline._phase_decrypt_standalone().
+_DECRYPT_SCRIPT = r'''
+import sys, os, struct
+sys.path.insert(0, "/tmp")
+from jjp_crypto import decrypt_file, detect_filler_size, crc32_buf, xor_keystream, PRNG
+from jjp_filelist import parse_fl_dat, detect_edata_prefix, FileEntry, write_fl_dat
+
+HAS_FL_DAT = {has_fl_dat}
+MP = "{mp}"
+OUT_DIR = "{out_dir}"
+EDATA_DIR = "{edata_dir}"
+GAME_NAME = "{game_name}"
+
+if HAS_FL_DAT:
+    entries = parse_fl_dat("/tmp/fl_decrypted.dat")
+    prefix = detect_edata_prefix(entries)
+else:
+    # Scan filesystem to build file list (dongle-free)
+    print("Scanning edata directory...", flush=True)
+    edata_root = EDATA_DIR
+    path_prefix = edata_root[len(MP):]
+    if not path_prefix.endswith("/"):
+        path_prefix += "/"
+
+    all_files = []
+    for dirpath, dirnames, filenames in os.walk(edata_root):
+        for fname in filenames:
+            full = os.path.join(dirpath, fname)
+            rel = os.path.relpath(full, edata_root)
+            crypto_path = path_prefix + rel
+            all_files.append((full, crypto_path))
+
+    print("TOTAL_FILES={{}}".format(len(all_files)), flush=True)
+    print("Detecting filler sizes...", flush=True)
+
+    entries = []
+    for idx, (full_path, crypto_path) in enumerate(all_files):
+        with open(full_path, "rb") as f:
+            enc_data = f.read()
+        if len(enc_data) < 8:
+            continue
+        filler_size = detect_filler_size(enc_data, crypto_path)
+        if filler_size < 0 or len(enc_data) <= filler_size:
+            continue
+        n2 = crc32_buf(enc_data)
+        entries.append(FileEntry(
+            path=crypto_path, filler_size=filler_size,
+            crc_encrypted=n2, crc_decrypted=0,
+        ))
+        if (idx + 1) % 500 == 0:
+            print("  Scanned {{}}/{{}}".format(idx + 1, len(all_files)), flush=True)
+
+    prefix = detect_edata_prefix(entries)
+    print("Scan complete: {{}} files found".format(len(entries)), flush=True)
+
+total = len(entries)
+if total == 0:
+    print("BATCH COMPLETE", flush=True)
+    print("Total: 0  OK: 0  Failed: 0  Skipped: 0", flush=True)
+    sys.exit(0)
+
+if HAS_FL_DAT:
+    print("TOTAL_FILES={{}}".format(total), flush=True)
+
+ok = fail = skip = 0
+computed_entries = []
+
+for i, e in enumerate(entries):
+    enc_path = MP + e.path
+    if not os.path.isfile(enc_path):
+        skip += 1
+        continue
+    try:
+        with open(enc_path, "rb") as f:
+            enc_data = f.read()
+        if len(enc_data) <= e.filler_size:
+            skip += 1
+            continue
+        content = decrypt_file(enc_data, e.filler_size, e.path)
+        rel = e.path[len(prefix):] if prefix and e.path.startswith(prefix) else e.path
+        out_path = OUT_DIR + "/" + rel
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "wb") as f:
+            f.write(content)
+        if not HAS_FL_DAT:
+            n3 = crc32_buf(content)
+            computed_entries.append(FileEntry(
+                path=e.path, filler_size=e.filler_size,
+                crc_encrypted=e.crc_encrypted, crc_decrypted=n3,
+            ))
+        ok += 1
+    except Exception as ex:
+        print("[FAIL] {{}}: {{}}".format(e.path, ex), flush=True)
+        fail += 1
+    if (i + 1) % 100 == 0 or i + 1 == total:
+        print("Progress: {{}} (ok={{}} fail={{}} skip={{}})".format(
+            i + 1, ok, fail, skip), flush=True)
+
+# Save generated fl_decrypted.dat if we scanned
+if not HAS_FL_DAT and computed_entries:
+    fl_out = OUT_DIR + "/fl_decrypted.dat"
+    write_fl_dat(computed_entries, fl_out)
+    print("Generated fl_decrypted.dat with {{}} entries".format(
+        len(computed_entries)), flush=True)
+
+print("BATCH COMPLETE", flush=True)
+print("Total: {{}}  OK: {{}}  Failed: {{}}  Skipped: {{}}".format(
+    ok + fail + skip, ok, fail, skip), flush=True)
+'''
+
+
 class PipelineError(Exception):
     """User-friendly pipeline error with phase context."""
     def __init__(self, phase, message):
@@ -121,42 +233,16 @@ class DecryptionPipeline:
             self.log("Input is a raw image, skipping extraction.", "info")
             return
 
-        # Use a deterministic cache path so we can reuse previous extractions
         self._raw_img_path = self._raw_img_cache_path()
 
-        # Check if a cached extraction already exists and is valid ext4
+        # Delete any stale image from a previous run
         try:
-            sz = self.wsl.run(f"stat -c%s '{self._raw_img_path}'", timeout=5).strip()
-            size_gb = int(sz) / (1024**3)
-            if int(sz) > 0:
-                # Validate it's actually a valid ext4 filesystem
-                try:
-                    fstype = self.wsl.run(
-                        f"blkid -o value -s TYPE '{self._raw_img_path}'",
-                        timeout=10,
-                    ).strip()
-                except WslError:
-                    fstype = ""
-                if "ext" in fstype:
-                    self.log(
-                        f"Found cached extraction: {self._raw_img_path} "
-                        f"({size_gb:.1f} GB, {fstype}). Skipping extract phase.",
-                        "success",
-                    )
-                    self.on_progress(100, 100, "Cached")
-                    return
-                else:
-                    self.log(
-                        f"Cached image exists but is not valid ext4 "
-                        f"(detected: {fstype or 'unknown'}). Re-extracting...",
-                        "info",
-                    )
-                    self.wsl.run(
-                        f"rm -f '{self._raw_img_path}' 2>/dev/null; true",
-                        timeout=10,
-                    )
-        except (WslError, ValueError):
-            pass  # No cache, proceed with extraction
+            self.wsl.run(
+                f"rm -f '{self._raw_img_path}' 2>/dev/null; true",
+                timeout=10,
+            )
+        except WslError:
+            pass
 
         self.log("Extracting ext4 filesystem from ISO...", "info")
         wsl_iso = win_to_wsl(self.image_path)
@@ -307,6 +393,38 @@ class DecryptionPipeline:
                 raise PipelineError("Extract",
                     f"partclone.restore failed: {e.output}") from e
 
+        # partclone.restore -C creates a truncated image containing only
+        # used blocks. The ext4 driver requires the image to be at least
+        # block_count * block_size bytes. Read the expected size from the
+        # ext4 superblock and extend the file if needed.
+        try:
+            sb_info = self.wsl.run(
+                f"dumpe2fs -h '{self._raw_img_path}' 2>/dev/null | "
+                f"grep -E '^Block (count|size):'",
+                timeout=15,
+            ).strip()
+            sb_blocks = 0
+            sb_bsize = 0
+            for sb_line in sb_info.split("\n"):
+                if "Block count:" in sb_line:
+                    sb_blocks = int(sb_line.split(":")[1].strip())
+                elif "Block size:" in sb_line:
+                    sb_bsize = int(sb_line.split(":")[1].strip())
+            if sb_blocks and sb_bsize:
+                expected_size = sb_blocks * sb_bsize
+                actual = int(self.wsl.run(
+                    f"stat -c%s '{self._raw_img_path}'", timeout=5).strip())
+                if actual < expected_size:
+                    self.log(
+                        f"Extending image to full filesystem size "
+                        f"({expected_size / (1024**3):.1f} GB)...", "info")
+                    self.wsl.run(
+                        f"truncate -s {expected_size} '{self._raw_img_path}'",
+                        timeout=30,
+                    )
+        except (WslError, ValueError):
+            pass  # If we can't extend, mount will fail with a clear error
+
     def _extract_with_python(self, parts, script_path=None):
         """Use the proven Python partclone converter."""
         self.log("Using Python partclone converter...", "info")
@@ -361,7 +479,7 @@ class DecryptionPipeline:
             # If this was a cached image, it may be corrupt — delete and re-extract
             if self._raw_img_path and self._is_iso():
                 self.log(
-                    "Mount failed with cached image. Deleting cache and re-extracting...",
+                    "Mount failed. Deleting image and re-extracting...",
                     "info",
                 )
                 try:
@@ -2120,7 +2238,742 @@ class ModPipeline(DecryptionPipeline):
         self.log("Cleanup complete.", "success")
 
 
-def check_prerequisites(wsl):
+class StandaloneDecryptPipeline(DecryptionPipeline):
+    """Decryption pipeline that uses pure Python crypto instead of dongle/chroot.
+
+    Works completely without a HASP dongle. If fl_dat_path is provided, uses
+    the cached file list. Otherwise, scans the filesystem and auto-detects
+    filler sizes using magic byte signatures.
+
+    Eliminates: Chroot, Dongle, Compile phases.
+    Phases: Extract > Mount > Decrypt > Copy > Cleanup
+    """
+
+    def __init__(self, image_path, output_path, fl_dat_path,
+                 log_cb, phase_cb, progress_cb, done_cb):
+        super().__init__(image_path, output_path,
+                         log_cb, phase_cb, progress_cb, done_cb)
+        self.fl_dat_path = fl_dat_path  # can be None for fully dongle-free
+
+    def run(self):
+        """Execute the standalone pipeline."""
+        cleanup_phase = len(config.STANDALONE_PHASES) - 1
+        try:
+            self.on_phase(0)  # Extract
+            self._phase_extract()
+            self._check_cancel()
+
+            self.on_phase(1)  # Mount
+            self._phase_mount()
+            self._check_cancel()
+
+            # Detect game name from the mount
+            self._detect_game()
+
+            self.on_phase(2)  # Decrypt
+            self._phase_decrypt_standalone()
+            self._check_cancel()
+
+            self._succeeded = True
+            self.on_phase(cleanup_phase)  # Cleanup
+            self._phase_cleanup_standalone()
+            self.on_done(True, f"Decryption complete! Files saved to:\n{self.output_path}")
+
+        except PipelineError as e:
+            self.log(str(e), "error")
+            self.on_phase(cleanup_phase)
+            self._phase_cleanup_standalone()
+            self.on_done(False, str(e))
+        except Exception as e:
+            self.log(f"Unexpected error: {e}", "error")
+            self.on_phase(cleanup_phase)
+            self._phase_cleanup_standalone()
+            self.on_done(False, f"Unexpected error: {e}")
+
+    def _detect_game(self):
+        """Detect game name from mount point (simplified, no chroot setup)."""
+        self.log("Scanning for game...", "info")
+        try:
+            result = self.wsl.run(
+                f"ls -1 {self.mount_point}{config.GAME_BASE_PATH}/",
+                timeout=15,
+            )
+        except WslError as e:
+            raise PipelineError("Mount",
+                f"No JJP game found at {config.GAME_BASE_PATH}/") from e
+
+        for name in result.strip().split("\n"):
+            name = name.strip()
+            if not name:
+                continue
+            game_path = f"{self.mount_point}{config.GAME_BASE_PATH}/{name}/game"
+            try:
+                self.wsl.run(f"test -f '{game_path}'", timeout=5)
+                self.game_name = name
+                display = config.KNOWN_GAMES.get(name, name)
+                self.log(f"Detected game: {display} ({name})", "success")
+                return
+            except WslError:
+                pass
+
+    def _phase_decrypt_standalone(self):
+        """Decrypt all files using pure Python crypto, running inside WSL.
+
+        Deploys crypto.py and filelist.py to WSL /tmp/ and runs a single
+        Python process that reads encrypted files from the mounted ext4
+        and writes decrypted output — avoiding per-file cross-OS overhead.
+
+        Supports two modes:
+        - With fl_dat_path: uses cached file list (fast)
+        - Without fl_dat_path: scans filesystem and auto-detects filler sizes
+        """
+        import os
+
+        mp = self.mount_point
+        wsl_out = win_to_wsl(self.output_path)
+        self.wsl.run(f"mkdir -p '{wsl_out}'", timeout=10)
+
+        # Deploy crypto module to WSL /tmp
+        self.log("Deploying Python crypto module to WSL...", "info")
+        pkg_dir = os.path.dirname(os.path.abspath(__file__))
+        for module in ("crypto.py", "filelist.py"):
+            src = win_to_wsl(os.path.join(pkg_dir, module))
+            self.wsl.run(f"cp '{src}' /tmp/jjp_{module}", timeout=10)
+
+        has_fl_dat = self.fl_dat_path and os.path.isfile(self.fl_dat_path)
+
+        if has_fl_dat:
+            # Copy cached fl.dat
+            wsl_fl = win_to_wsl(self.fl_dat_path)
+            self.wsl.run(
+                f"cp '{wsl_fl}' '{wsl_out}/fl_decrypted.dat'", timeout=10)
+            self.wsl.run(
+                f"cp '{wsl_fl}' /tmp/fl_decrypted.dat", timeout=10)
+            self.log("Using cached fl_decrypted.dat", "info")
+        else:
+            self.log(
+                "No fl_decrypted.dat found. Scanning filesystem to "
+                "auto-detect filler sizes (dongle-free mode)...", "info")
+
+        # Build the decrypt script — writes directly to Windows output folder
+        game_name = self.game_name or ""
+        edata_dir = f"{mp}{config.GAME_BASE_PATH}/{game_name}/edata"
+
+        script = _DECRYPT_SCRIPT.format(
+            has_fl_dat="True" if has_fl_dat else "False",
+            mp=mp,
+            out_dir=wsl_out,
+            edata_dir=edata_dir,
+            game_name=game_name,
+        )
+
+        # Write script to WSL /tmp
+        import base64 as _b64
+        script_b64 = _b64.b64encode(script.encode()).decode()
+        self.wsl.run(
+            f"echo '{script_b64}' | base64 -d > /tmp/jjp_decrypt_run.py",
+            timeout=10)
+
+        cmd = "PYTHONUNBUFFERED=1 python3 /tmp/jjp_decrypt_run.py 2>&1"
+
+        total_files = 0
+        final_ok = 0
+        final_fail = 0
+        final_total = 0
+
+        total_re = re.compile(r'TOTAL_FILES=(\d+)')
+        progress_re = re.compile(
+            r'Progress:\s*(\d+)\s*\(ok=(\d+)\s+fail=(\d+)\s+skip=(\d+)\)')
+        result_re = re.compile(
+            r'Total:\s*(\d+)\s+OK:\s*(\d+)\s+Failed:\s*(\d+)\s+Skipped:\s*(\d+)')
+
+        try:
+            for line in self.wsl.stream(cmd, timeout=config.DECRYPT_TIMEOUT):
+                if self.cancelled:
+                    self.wsl.kill()
+                    raise PipelineError("Decrypt", "Cancelled by user.")
+
+                level = "info"
+                if "[FAIL]" in line:
+                    level = "error"
+
+                m = total_re.search(line)
+                if m:
+                    total_files = int(m.group(1))
+                    self.on_progress(0, total_files, "Decrypting...")
+
+                m = progress_re.search(line)
+                if m:
+                    current = int(m.group(1))
+                    ok = int(m.group(2))
+                    fail = int(m.group(3))
+                    skip = int(m.group(4))
+                    desc = f"ok={ok} fail={fail} skip={skip}"
+                    self.on_progress(current, total_files, desc)
+
+                m = result_re.search(line)
+                if m:
+                    final_total = int(m.group(1))
+                    final_ok = int(m.group(2))
+                    final_fail = int(m.group(3))
+
+                self.log(line, level)
+
+        except WslError as e:
+            if final_total > 0:
+                pass
+            else:
+                raise PipelineError("Decrypt",
+                    f"Decryption process failed: {e.output}") from e
+
+        if final_total == 0 and total_files == 0:
+            raise PipelineError("Decrypt",
+                "No files were decrypted. Check fl_decrypted.dat path mapping.")
+
+        self.on_progress(final_total, final_total, "Complete")
+        self.log(
+            f"Decryption finished: {final_ok} OK, {final_fail} failed "
+            f"out of {final_total} files.",
+            "success" if final_fail == 0 else "info",
+        )
+
+        # Generate checksums for future modification comparison
+        wsl_out = win_to_wsl(self.output_path)
+        self.log("Generating checksums for asset tracking...", "info")
+        try:
+            self.wsl.run(
+                f"cd '{wsl_out}' && find . -type f ! -name '.*' ! -name 'fl_decrypted.dat' "
+                f"! -name '*.img' -print0 | xargs -0 md5sum > '.checksums.md5'",
+                timeout=600,
+            )
+            self.log("Checksums saved to .checksums.md5 in output folder.", "success")
+        except WslError:
+            self.log("Warning: Could not generate checksums. "
+                     "Asset modification tracking will not be available.", "info")
+
+    def _phase_cleanup_standalone(self):
+        """Simplified cleanup - no daemon or USB to clean up."""
+        self.log("Cleaning up...", "info")
+
+        if self.mount_point:
+            try:
+                self.wsl.run(
+                    f"umount -l '{self.mount_point}' 2>/dev/null; true",
+                    timeout=30)
+            except WslError:
+                pass
+            try:
+                self.wsl.run(
+                    f"rmdir '{self.mount_point}' 2>/dev/null; true", timeout=5)
+            except WslError:
+                pass
+
+        if self._iso_mount:
+            try:
+                self.wsl.run(
+                    f"umount -l '{self._iso_mount}' 2>/dev/null; true",
+                    timeout=15)
+                self.wsl.run(
+                    f"rmdir '{self._iso_mount}' 2>/dev/null; true", timeout=5)
+            except WslError:
+                pass
+
+        if self._raw_img_path and self._raw_img_path.startswith("/tmp/"):
+            try:
+                self.wsl.run(
+                    f"rm -f '{self._raw_img_path}' 2>/dev/null; true",
+                    timeout=10)
+            except WslError:
+                pass
+
+        self.log("Cleanup complete.", "success")
+
+
+class StandaloneModPipeline(ModPipeline):
+    """Mod pipeline using pure Python crypto instead of dongle/chroot.
+
+    Requires a previously-cached fl_decrypted.dat.
+    Eliminates: Chroot, Dongle, Compile phases.
+    Phases: Scan > Extract > Mount > Encrypt > Convert > Build ISO > Cleanup
+    """
+
+    def __init__(self, image_path, assets_folder, fl_dat_path,
+                 log_cb, phase_cb, progress_cb, done_cb):
+        super().__init__(image_path, assets_folder,
+                         log_cb, phase_cb, progress_cb, done_cb)
+        self.fl_dat_path = fl_dat_path
+
+    def run(self):
+        """Execute the standalone mod pipeline."""
+        import os
+        cleanup_phase = len(config.STANDALONE_MOD_PHASES) - 1
+        try:
+            self.on_phase(0)  # Scan
+            self._phase_scan()
+            self._check_cancel()
+
+            if not self.changed_files:
+                self.on_done(True,
+                    "No changes detected in the assets folder.\n"
+                    "Modify files in the output folder and try again.")
+                return
+
+            self.on_phase(1)  # Extract
+            self._phase_extract()
+            self._check_cancel()
+
+            self.on_phase(2)  # Mount
+            self._phase_mount_rw()
+            self._check_cancel()
+
+            self.on_phase(3)  # Encrypt
+            self._phase_encrypt_standalone()
+            self._check_cancel()
+
+            if self._is_iso():
+                self.on_phase(4)  # Convert
+                self._phase_convert_standalone()
+                self._check_cancel()
+
+                self.on_phase(5)  # Build ISO
+                self._phase_build_iso()
+                self._check_cancel()
+
+            self._succeeded = True
+            self.on_phase(cleanup_phase)
+            self._phase_cleanup_standalone()
+
+            if self._is_iso() and hasattr(self, '_output_iso_path'):
+                win_path = self._output_iso_path
+                self.log(f"Modified ISO ready at: {win_path}", "success")
+                self.on_done(True,
+                    f"Asset modification complete!\n"
+                    f"Modified ISO at:\n{win_path}")
+                self.log("", "info")
+                self.log("=== Next Steps ===", "info")
+                self.log(
+                    "1. Write this ISO to a USB drive using Rufus\n"
+                    "   Important: select ISO mode (NOT DD mode) when prompted\n"
+                    "2. Boot the pinball machine from USB\n"
+                    "3. Let Clonezilla restore the image to the machine",
+                    "info",
+                )
+                self.log_link(
+                    "JJP USB Update Instructions (PDF)",
+                    "https://marketing.jerseyjackpinball.com/general/install-full/"
+                    "JJP_USB_UPDATE_PC_instructions.pdf",
+                )
+            else:
+                img_name = (self._raw_img_path.rsplit("/", 1)[-1]
+                            if self._raw_img_path else "image")
+                wsl_out = win_to_wsl(self.assets_folder)
+                dest = f"{wsl_out}/{img_name}"
+                win_path = os.path.join(self.assets_folder, img_name)
+                if self._raw_img_path and self._raw_img_path != dest:
+                    self.log("Moving modified image to output folder...", "info")
+                    try:
+                        for line in self.wsl.stream(
+                            f"rsync --info=progress2 --no-inc-recursive "
+                            f"--remove-source-files "
+                            f"'{self._raw_img_path}' '{dest}'",
+                            timeout=config.COPY_TIMEOUT,
+                        ):
+                            self._check_cancel()
+                    except WslError:
+                        pass
+                self.log(f"Modified image ready at: {win_path}", "success")
+                self.on_done(True,
+                    f"Asset modification complete!\n"
+                    f"Modified image at:\n{win_path}")
+
+        except PipelineError as e:
+            self.log(str(e), "error")
+            self.on_phase(cleanup_phase)
+            self._phase_cleanup_standalone()
+            self.on_done(False, str(e))
+        except Exception as e:
+            self.log(f"Unexpected error: {e}", "error")
+            self.on_phase(cleanup_phase)
+            self._phase_cleanup_standalone()
+            self.on_done(False, f"Unexpected error: {e}")
+
+    def _phase_mount_rw(self):
+        """Mount the ext4 image read-write (no chroot/bind mounts needed)."""
+        self.log("Mounting ext4 image read-write...", "info")
+        if self._raw_img_path:
+            wsl_img = self._raw_img_path
+        else:
+            wsl_img = win_to_wsl(self.image_path)
+
+        self._cleanup_stale_mounts(wsl_img)
+        import uuid as _uuid
+        tag = _uuid.uuid4().hex[:8]
+        self.mount_point = f"{config.MOUNT_PREFIX}{tag}"
+
+        try:
+            self.wsl.run(f"mkdir -p {self.mount_point}", timeout=10)
+            self.wsl.run(
+                f"mount -o loop '{wsl_img}' {self.mount_point}",
+                timeout=config.MOUNT_TIMEOUT,
+            )
+            self.log(f"Mounted at {self.mount_point}", "success")
+        except WslError as e:
+            raise PipelineError("Mount",
+                f"Failed to mount image: {e.output}") from e
+
+        # Detect game name
+        try:
+            result = self.wsl.run(
+                f"ls -1 {self.mount_point}{config.GAME_BASE_PATH}/",
+                timeout=15,
+            )
+            for name in result.strip().split("\n"):
+                name = name.strip()
+                if not name:
+                    continue
+                game_path = (f"{self.mount_point}{config.GAME_BASE_PATH}/"
+                             f"{name}/game")
+                try:
+                    self.wsl.run(f"test -f '{game_path}'", timeout=5)
+                    self.game_name = name
+                    display = config.KNOWN_GAMES.get(name, name)
+                    self.log(f"Detected game: {display} ({name})", "success")
+                    break
+                except WslError:
+                    pass
+        except WslError:
+            pass
+
+    def _phase_encrypt_standalone(self):
+        """Re-encrypt changed files using pure Python crypto."""
+        import os
+        from .crypto import encrypt_file
+        from .filelist import parse_fl_dat, detect_edata_prefix
+
+        self.log("Loading file list...", "info")
+        entries = parse_fl_dat(self.fl_dat_path)
+        edata_prefix = detect_edata_prefix(entries)
+
+        # Build lookup
+        entry_map = {e.path: e for e in entries}
+        self.log(f"Loaded {len(entries)} fl.dat entries.", "info")
+
+        mp = self.mount_point
+        total = len(self.changed_files)
+        ok = 0
+        fail = 0
+
+        self.on_progress(0, total, "Encrypting...")
+        self.log(f"TOTAL_FILES={total}", "info")
+
+        for i, (rel_path, win_path) in enumerate(self.changed_files):
+            self._check_cancel()
+
+            # Find fl.dat entry
+            full_path = f"{edata_prefix}{rel_path}"
+            entry = entry_map.get(full_path)
+            if not entry:
+                self.log(f"[FAIL] {rel_path} (not found in fl.dat)", "error")
+                fail += 1
+                continue
+
+            # Read replacement content
+            with open(win_path, 'rb') as f:
+                content = f.read()
+
+            self.log(f"Processing: {full_path}", "info")
+            self.log(f"  filler={entry.filler_size} "
+                     f"orig_n2={entry.crc_encrypted} "
+                     f"orig_n3={entry.crc_decrypted}", "info")
+
+            # Encrypt with CRC forgery
+            try:
+                encrypted = encrypt_file(
+                    content, entry.filler_size, entry.path,
+                    entry.crc_encrypted, entry.crc_decrypted)
+            except Exception as e:
+                self.log(f"[FAIL] {rel_path}: {e}", "error")
+                fail += 1
+                continue
+
+            # Verify CRCs
+            from .crypto import crc32_buf, decrypt_file as _df
+            n2 = crc32_buf(encrypted)
+            re_dec = _df(encrypted, entry.filler_size, entry.path)
+            n3 = crc32_buf(re_dec)
+            n2_ok = n2 == entry.crc_encrypted
+            n3_ok = n3 == entry.crc_decrypted
+
+            self.log(f"  n2 forge: want={entry.crc_encrypted} "
+                     f"got={n2} {'OK' if n2_ok else 'FAIL'}", "info")
+            self.log(f"  n3 forge: want={entry.crc_decrypted} "
+                     f"got={n3} {'OK' if n3_ok else 'FAIL'}", "info")
+
+            if not (n2_ok and n3_ok):
+                self.log(f"[VERIFY FAIL] {rel_path}", "error")
+                fail += 1
+                continue
+
+            # Write encrypted file to game image
+            import base64 as _b64
+            enc_b64 = _b64.b64encode(encrypted).decode()
+            dest_path = f"{mp}{entry.path}"
+            try:
+                if len(enc_b64) > 100000:
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(
+                        mode='w', suffix='.b64', delete=False,
+                        dir=os.environ.get('TEMP', os.environ.get('TMP', '.')),
+                    ) as tf:
+                        tf.write(enc_b64)
+                        tmp_win = tf.name
+                    wsl_tmp = win_to_wsl(tmp_win)
+                    try:
+                        self.wsl.run(
+                            f"base64 -d '{wsl_tmp}' > '{dest_path}'",
+                            timeout=60)
+                    finally:
+                        os.unlink(tmp_win)
+                else:
+                    self.wsl.run(
+                        f"echo '{enc_b64}' | base64 -d > '{dest_path}'",
+                        timeout=30)
+                self.log(f"[VERIFY OK] {rel_path}", "success")
+                ok += 1
+            except (WslError, OSError) as e:
+                self.log(f"[FAIL] {rel_path} (write failed: {e})", "error")
+                fail += 1
+
+            self.on_progress(i + 1, total, f"ok={ok} fail={fail}")
+
+        self.on_progress(total, total, "Complete")
+        summary = f"{ok}/{total} files replaced and verified"
+        if fail > 0:
+            summary += f" ({fail} FAILED)"
+            self.log(summary, "error")
+        else:
+            summary += " successfully"
+            self.log(summary, "success")
+
+        self.log("CRC32 forgery: encrypted files match original fl.dat checksums.",
+                 "success")
+
+    def _phase_convert_standalone(self):
+        """Unmount and convert - same as parent but no bind mounts to clean."""
+        if self.mount_point:
+            self.log("Unmounting ext4 for conversion...", "info")
+            try:
+                self.wsl.run(
+                    f"umount '{self.mount_point}'", timeout=30)
+            except WslError:
+                self.wsl.run(
+                    f"umount -l '{self.mount_point}' 2>/dev/null; true",
+                    timeout=30)
+            try:
+                self.wsl.run(
+                    f"rmdir '{self.mount_point}' 2>/dev/null; true", timeout=5)
+            except WslError:
+                pass
+            self.mount_point = None
+
+        wsl_img = self._raw_img_path
+        self.log("Running e2fsck...", "info")
+        try:
+            for line in self.wsl.stream(
+                f"e2fsck -fy '{wsl_img}' 2>&1", timeout=300
+            ):
+                clean = line.strip()
+                if clean:
+                    self.log(f"  {clean}", "info")
+        except WslError:
+            pass
+
+        self._ensure_iso_tools()
+
+        if not self._iso_mount:
+            wsl_iso = win_to_wsl(self.image_path)
+            import uuid as _uuid
+            tag = _uuid.uuid4().hex[:8]
+            self._iso_mount = f"/tmp/jjp_iso_{tag}"
+            try:
+                self.wsl.run(f"mkdir -p {self._iso_mount}", timeout=10)
+                self.wsl.run(
+                    f"mount -o loop,ro '{wsl_iso}' {self._iso_mount}",
+                    timeout=config.MOUNT_TIMEOUT)
+            except WslError as e:
+                raise PipelineError("Convert",
+                    f"Failed to mount original ISO: {e.output}") from e
+
+        # Rest is same as parent _phase_convert from the partclone step
+        partimag = f"{self._iso_mount}{config.PARTIMAG_PATH}"
+        part_prefix = f"{partimag}/{config.GAME_PARTITION}.ext4-ptcl-img.gz"
+        try:
+            parts_out = self.wsl.run(
+                f"ls -1 {part_prefix}.* 2>/dev/null | sort", timeout=10)
+        except WslError:
+            parts_out = ""
+        parts = [p.strip() for p in parts_out.strip().split("\n") if p.strip()]
+        if not parts:
+            raise PipelineError("Convert",
+                f"No partclone image for {config.GAME_PARTITION} found in ISO.")
+
+        split_size = "1000000000"
+        try:
+            sz = self.wsl.run(
+                f"stat -c%s '{parts[0]}'", timeout=5).strip()
+            split_size = sz
+        except (WslError, ValueError):
+            pass
+
+        try:
+            self.wsl.run("which pigz", timeout=5)
+            compressor = "pigz -c --fast -b 1024 --rsyncable"
+        except WslError:
+            compressor = "gzip -c --fast --rsyncable"
+
+        import uuid as _uuid
+        tag = _uuid.uuid4().hex[:8]
+        self._chunks_dir = f"/tmp/jjp_chunks_{tag}"
+        output_prefix = (f"{self._chunks_dir}/"
+                         f"{config.GAME_PARTITION}.ext4-ptcl-img.gz.")
+        self.wsl.run(f"mkdir -p '{self._chunks_dir}'", timeout=10)
+
+        self.log(f"Converting {wsl_img} to partclone format...", "info")
+        self.log("This may take 10-30 minutes depending on image size.", "info")
+
+        convert_cmd = (
+            f"set -o pipefail && "
+            f"partclone.ext4 -c -s '{wsl_img}' -o - "
+            f"2> >(stdbuf -oL tr '\\r' '\\n' > /tmp/jjp_ptcl.log) "
+            f"| {compressor} "
+            f"| split -b {split_size} -a 2 - '{output_prefix}'"
+        )
+        monitor_script = (
+            f"#!/bin/bash\n"
+            f"({convert_cmd}) &\n"
+            f"PID=$!\n"
+            f"LAST_PCT=-1\n"
+            f"while kill -0 $PID 2>/dev/null; do\n"
+            f"  sleep 3\n"
+            f"  PCT=$(grep -oP 'Completed:\\s*\\K[\\d.]+' "
+            f"/tmp/jjp_ptcl.log 2>/dev/null | tail -1)\n"
+            f"  OSIZE=$(du -sb '{output_prefix}'* 2>/dev/null "
+            f"| awk '{{s+=$1}} END {{printf \"%d\", s}}')\n"
+            f"  if [ -n \"$PCT\" ]; then\n"
+            f"    CUR=$(printf '%.0f' \"$PCT\" 2>/dev/null || echo 0)\n"
+            f"    if [ \"$CUR\" != \"$LAST_PCT\" ]; then\n"
+            f"      LAST_PCT=$CUR\n"
+            f"      echo \"PROGRESS:${{PCT}}% output=${{OSIZE:-0}}\"\n"
+            f"    fi\n"
+            f"  else\n"
+            f"    echo \"PROGRESS:0% output=${{OSIZE:-0}}\"\n"
+            f"  fi\n"
+            f"done\n"
+            f"wait $PID\n"
+            f"exit $?\n"
+        )
+        import base64
+        monitor_path = "/tmp/jjp_convert_monitor.sh"
+        monitor_b64 = base64.b64encode(monitor_script.encode()).decode()
+        self.wsl.run(
+            f"echo '{monitor_b64}' | base64 -d > {monitor_path} && "
+            f"chmod +x {monitor_path}",
+            timeout=10)
+
+        self.log("Starting partclone conversion pipeline...", "info")
+        last_pct = -1
+        try:
+            for line in self.wsl.stream(
+                f"bash {monitor_path}", timeout=config.ISO_CONVERT_TIMEOUT
+            ):
+                if self.cancelled:
+                    self.wsl.kill()
+                    raise PipelineError("Convert", "Cancelled by user.")
+                clean = line.strip()
+                if not clean:
+                    continue
+                m = re.search(r'PROGRESS:([\d.]+)%\s*output=(\d+)', clean)
+                if m:
+                    pct = float(m.group(1))
+                    ipct = int(pct)
+                    out_mb = int(m.group(2)) / (1024**2)
+                    if ipct > last_pct:
+                        last_pct = ipct
+                        self.on_progress(ipct, 100,
+                            f"{ipct}% ({out_mb:.0f} MB written)")
+                        if ipct % 10 == 0:
+                            self.log(
+                                f"  Conversion: {ipct}% "
+                                f"({out_mb:.0f} MB written)", "info")
+        except WslError as e:
+            log_content = ""
+            try:
+                log_content = self.wsl.run(
+                    "tail -5 /tmp/jjp_ptcl.log 2>/dev/null",
+                    timeout=5).strip()
+            except WslError:
+                pass
+            raise PipelineError("Convert",
+                f"Partclone conversion failed: {e.output}\n"
+                f"{log_content}") from e
+
+        try:
+            parts_out = self.wsl.run(
+                f"ls -lh '{output_prefix}'* 2>/dev/null",
+                timeout=10).strip()
+            self.log(f"Partclone files created:\n{parts_out}", "success")
+        except WslError:
+            raise PipelineError("Convert",
+                "No partclone output files were created.")
+
+        self.on_progress(100, 100, "Conversion complete")
+
+    def _phase_cleanup_standalone(self):
+        """Simplified cleanup - no daemon or USB."""
+        self.log("Cleaning up...", "info")
+
+        if self.mount_point:
+            try:
+                self.wsl.run(
+                    f"umount -l '{self.mount_point}' 2>/dev/null; true",
+                    timeout=30)
+            except WslError:
+                pass
+            try:
+                self.wsl.run(
+                    f"rmdir '{self.mount_point}' 2>/dev/null; true",
+                    timeout=5)
+            except WslError:
+                pass
+
+        if self._iso_mount:
+            try:
+                self.wsl.run(
+                    f"umount -l '{self._iso_mount}' 2>/dev/null; true",
+                    timeout=15)
+                self.wsl.run(
+                    f"rmdir '{self._iso_mount}' 2>/dev/null; true",
+                    timeout=5)
+            except WslError:
+                pass
+
+        if hasattr(self, '_chunks_dir') and self._chunks_dir:
+            try:
+                self.wsl.run(
+                    f"rm -rf '{self._chunks_dir}'", timeout=60)
+            except WslError:
+                pass
+
+        try:
+            self.wsl.run(
+                "rm -f /tmp/jjp_ptcl.log 2>/dev/null; true", timeout=5)
+        except WslError:
+            pass
+
+        self.log("Cleanup complete.", "success")
+
+
+def check_prerequisites(wsl, standalone=False):
     """Check all prerequisites. Returns list of (name, passed, message) tuples."""
     results = []
 
@@ -2130,32 +2983,6 @@ def check_prerequisites(wsl):
         results.append(("WSL2", True, "Available"))
     except Exception:
         results.append(("WSL2", False, "WSL2 not available. Install from Microsoft Store."))
-
-    # gcc
-    try:
-        out = wsl.run("gcc --version 2>&1 | head -1", timeout=15)
-        results.append(("gcc", True, out.strip()))
-    except Exception:
-        results.append(("gcc", False,
-            "gcc not found. Run: wsl -u root -- apt install gcc"))
-
-    # usbipd-win
-    usbipd = find_usbipd()
-    rc, stdout, _ = wsl.run_win([usbipd, "--version"], timeout=10)
-    if rc == 0:
-        results.append(("usbipd-win", True, stdout.strip()))
-    else:
-        results.append(("usbipd-win", False,
-            "usbipd-win not found. Install from:\n"
-            "https://github.com/dorssel/usbipd-win"))
-
-    # HASP dongle
-    rc, stdout, _ = wsl.run_win([usbipd, "list"], timeout=10)
-    if rc == 0 and config.HASP_VID_PID in stdout:
-        results.append(("HASP Dongle", True, "Detected"))
-    else:
-        results.append(("HASP Dongle", False,
-            "Sentinel HASP dongle not detected. Plug it in."))
 
     # partclone
     try:

@@ -320,7 +320,7 @@ class MainWindow:
         self.prereq_grid.pack(fill=tk.X)
 
         self.prereq_labels = {}
-        prereq_names = ["WSL2", "gcc", "usbipd-win", "HASP Dongle", "partclone", "xorriso"]
+        prereq_names = ["WSL2", "partclone", "xorriso"]
         for i, name in enumerate(prereq_names):
             col = i % 2
             row_idx = i // 2
@@ -338,16 +338,12 @@ class MainWindow:
         self.check_btn.pack(side=tk.LEFT, padx=4)
 
     def _build_decrypt_tab(self, parent):
-        # Step indicator
-        step_row = ttk.Frame(parent)
-        step_row.pack(fill=tk.X, pady=(0, 6))
+        # Step indicator (rebuilt dynamically for standalone vs normal mode)
+        self._decrypt_step_row = ttk.Frame(parent)
+        self._decrypt_step_row.pack(fill=tk.X, pady=(0, 6))
         self.step_labels = []
-        for i, phase in enumerate(config.PHASES):
-            if i > 0:
-                ttk.Label(step_row, text=" > ", foreground="gray").pack(side=tk.LEFT)
-            lbl = ttk.Label(step_row, text=f"{i+1}. {phase}", foreground="gray")
-            lbl.pack(side=tk.LEFT)
-            self.step_labels.append(lbl)
+        self._build_step_labels(self._decrypt_step_row, config.PHASES,
+                                self.step_labels)
 
         # Progress bar
         prog_row = ttk.Frame(parent)
@@ -377,16 +373,12 @@ class MainWindow:
                   wraplength=700, foreground="gray", justify=tk.LEFT
                   ).pack(anchor=tk.W, pady=(0, 6))
 
-        # Step indicator for mod phases
-        step_row = ttk.Frame(parent)
-        step_row.pack(fill=tk.X, pady=(0, 6))
+        # Step indicator for mod phases (rebuilt dynamically)
+        self._mod_step_row = ttk.Frame(parent)
+        self._mod_step_row.pack(fill=tk.X, pady=(0, 6))
         self.mod_step_labels = []
-        for i, phase in enumerate(config.MOD_PHASES):
-            if i > 0:
-                ttk.Label(step_row, text=" > ", foreground="gray").pack(side=tk.LEFT)
-            lbl = ttk.Label(step_row, text=f"{i+1}. {phase}", foreground="gray")
-            lbl.pack(side=tk.LEFT)
-            self.mod_step_labels.append(lbl)
+        self._build_step_labels(self._mod_step_row, config.MOD_PHASES,
+                                self.mod_step_labels)
 
         # Progress bar
         prog_row = ttk.Frame(parent)
@@ -505,10 +497,31 @@ class MainWindow:
             else:
                 label.configure(text="[  X ]", foreground=c["error"])
 
+    def _build_step_labels(self, parent, phases, label_list):
+        """Build step indicator labels into a frame."""
+        for widget in parent.winfo_children():
+            widget.destroy()
+        label_list.clear()
+        c = _THEMES[self._current_theme]
+        for i, phase in enumerate(phases):
+            if i > 0:
+                ttk.Label(parent, text=" > ",
+                          foreground=c["gray"]).pack(side=tk.LEFT)
+            lbl = ttk.Label(parent, text=f"{i+1}. {phase}",
+                            foreground=c["gray"])
+            lbl.pack(side=tk.LEFT)
+            label_list.append(lbl)
+
+    def _get_labels_for_mode(self, mode):
+        """Return the appropriate step labels list for a mode."""
+        if mode in ("decrypt", "decrypt_standalone"):
+            return self.step_labels
+        return self.mod_step_labels
+
     def set_phase(self, phase_index, mode="decrypt"):
         """Highlight the current phase in the step indicator."""
         c = _THEMES[self._current_theme]
-        labels = self.step_labels if mode == "decrypt" else self.mod_step_labels
+        labels = self._get_labels_for_mode(mode)
         for i, lbl in enumerate(labels):
             if i < phase_index:
                 lbl.configure(foreground=c["success"])
@@ -518,7 +531,7 @@ class MainWindow:
                 lbl.configure(foreground=c["gray"], font=("TkDefaultFont", 9))
 
         # Reset progress bar to indeterminate until the phase sets its own progress
-        if mode == "decrypt":
+        if mode in ("decrypt", "decrypt_standalone"):
             self.progress.configure(mode="indeterminate")
             self.progress.start(15)
             self.progress_label.configure(text="")
@@ -529,7 +542,7 @@ class MainWindow:
 
     def set_progress(self, current, total, description="", mode="decrypt"):
         """Update the progress bar and label."""
-        if mode == "decrypt":
+        if mode in ("decrypt", "decrypt_standalone"):
             bar = self.progress
             label = self.progress_label
         else:
@@ -560,7 +573,7 @@ class MainWindow:
             self.check_btn.configure(state=tk.DISABLED)
             self.start_btn.configure(state=tk.DISABLED)
             self.mod_apply_btn.configure(state=tk.DISABLED)
-            if mode == "decrypt":
+            if mode in ("decrypt", "decrypt_standalone"):
                 self.cancel_btn.configure(state=tk.NORMAL)
             else:
                 self.mod_cancel_btn.configure(state=tk.NORMAL)
@@ -591,19 +604,40 @@ class MainWindow:
         self.status_label.configure(text=text)
 
     def reset_steps(self, mode="decrypt"):
-        """Reset step indicators and progress for the given mode."""
-        c = _THEMES[self._current_theme]
-        labels = self.step_labels if mode == "decrypt" else self.mod_step_labels
-        for lbl in labels:
-            lbl.configure(foreground=c["gray"], font=("TkDefaultFont", 9))
-        if mode == "decrypt":
+        """Reset step indicators and progress for the given mode.
+
+        Rebuilds the step labels if the mode has changed (e.g. standalone vs normal).
+        """
+        # Determine which phases and labels to use
+        phase_map = {
+            "decrypt": config.PHASES,
+            "modify": config.MOD_PHASES,
+            "decrypt_standalone": config.STANDALONE_PHASES,
+            "modify_standalone": config.STANDALONE_MOD_PHASES,
+        }
+        phases = phase_map.get(mode, config.PHASES)
+
+        if mode in ("decrypt", "decrypt_standalone"):
+            # Rebuild labels if phase count changed
+            if len(self.step_labels) != len(phases):
+                self._build_step_labels(self._decrypt_step_row, phases,
+                                        self.step_labels)
+            labels = self.step_labels
             self.progress.stop()
             self.progress.configure(mode="determinate", value=0, maximum=100)
             self.progress_label.configure(text="")
         else:
+            if len(self.mod_step_labels) != len(phases):
+                self._build_step_labels(self._mod_step_row, phases,
+                                        self.mod_step_labels)
+            labels = self.mod_step_labels
             self.mod_progress.stop()
             self.mod_progress.configure(mode="determinate", value=0, maximum=100)
             self.mod_progress_label.configure(text="")
+
+        c = _THEMES[self._current_theme]
+        for lbl in labels:
+            lbl.configure(foreground=c["gray"], font=("TkDefaultFont", 9))
 
     def _show_help(self):
         """Open a window displaying the README."""
