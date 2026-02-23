@@ -490,10 +490,10 @@ class MainWindow:
         path = filedialog.askopenfilename(
             title="Select JJP Game Image (ISO or ext4)",
             filetypes=[
+                ("All Files", "*.*"),
                 ("JJP Game Images", "*.iso *.img *.ext4 *.raw"),
                 ("ISO Images", "*.iso"),
                 ("Disk Images", "*.img *.ext4 *.raw"),
-                ("All Files", "*.*"),
             ],
         )
         if path:

@@ -2257,14 +2257,16 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
 
     def run(self):
         """Execute the standalone pipeline."""
+        import os
         from .executor import DockerExecutor
         cleanup_phase = len(config.STANDALONE_PHASES) - 1
         try:
             # Start Docker container if on macOS
             if isinstance(self.executor, DockerExecutor):
                 self.log("Starting Docker container...", "info")
+                project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 self.executor.start_container([
-                    self.image_path, self.output_path])
+                    self.image_path, self.output_path, project_dir])
 
             self.on_phase(0)  # Extract
             self._phase_extract()
@@ -2527,8 +2529,9 @@ class StandaloneModPipeline(ModPipeline):
             # Start Docker container if on macOS
             if isinstance(self.executor, DockerExecutor):
                 self.log("Starting Docker container...", "info")
+                project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 self.executor.start_container([
-                    self.image_path, self.assets_folder])
+                    self.image_path, self.assets_folder, project_dir])
 
             self.on_phase(0)  # Scan
             self._phase_scan()
