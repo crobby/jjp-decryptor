@@ -33,6 +33,8 @@ class MultiFileReader:
     def read(self, n):
         data = b""
         while len(data) < n:
+            if self.current_file is None:
+                break
             chunk = self.current_file.read(n - len(data))
             if chunk:
                 data += chunk
@@ -40,13 +42,15 @@ class MultiFileReader:
                 self.current_file.close()
                 self.current_index += 1
                 if self.current_index >= len(self.file_paths):
+                    self.current_file = None
                     break
                 self.current_file = open(self.file_paths[self.current_index], "rb")
         return data
 
     def close(self):
-        if self.current_file:
+        if self.current_file is not None:
             self.current_file.close()
+            self.current_file = None
 
 
 def convert_partclone_to_raw(input_parts, output_path):
