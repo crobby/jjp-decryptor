@@ -61,7 +61,6 @@ Download from the [Releases page](https://github.com/davidvanderburgh/jjp-decryp
 
 - **Windows**: `JJP_Asset_Decryptor_Setup.exe` — includes bundled Python runtime
 - **macOS**: `JJP_Asset_Decryptor.dmg` — drag to Applications
-- **Linux**: `JJP_Asset_Decryptor.AppImage` — make executable and run
 
 **Windows installer note**: When prompted, check **Install prerequisites** to set up WSL2, partclone, and xorriso. If WSL2 was just enabled, reboot and re-run the prerequisites installer from the Start Menu.
 
