@@ -35,6 +35,7 @@ pyinstaller \
     --name "JJP Asset Decryptor" \
     --windowed \
     --icon "$SCRIPT_DIR/build/icon.icns" \
+    --paths "$ROOT_DIR" \
     --add-data "$ROOT_DIR/jjp_decryptor/icon.png:jjp_decryptor" \
     --add-data "$ROOT_DIR/jjp_decryptor/Dockerfile:jjp_decryptor" \
     --add-data "$ROOT_DIR/partclone_to_raw.py:." \
@@ -43,12 +44,16 @@ pyinstaller \
     --distpath "$SCRIPT_DIR/build/dist" \
     --workpath "$SCRIPT_DIR/build/work" \
     --specpath "$SCRIPT_DIR/build" \
-    jjp_decryptor/__main__.py
+    "$SCRIPT_DIR/pyinstaller_entry.py"
 
 APP_PATH="$SCRIPT_DIR/build/dist/JJP Asset Decryptor.app"
 
 # Bundle Dockerfile inside .app Resources
 cp "$ROOT_DIR/jjp_decryptor/Dockerfile" "$APP_PATH/Contents/Resources/"
+
+# Generate DMG background with arrow
+echo "Generating DMG background..."
+python3 "$ROOT_DIR/installer/generate_dmg_background.py" "$SCRIPT_DIR/build/dmg_background.tiff"
 
 # Create DMG
 echo "Creating DMG..."
@@ -57,6 +62,7 @@ if command -v create-dmg &>/dev/null; then
     create-dmg \
         --volname "JJP Asset Decryptor" \
         --volicon "$SCRIPT_DIR/build/icon.icns" \
+        --background "$SCRIPT_DIR/build/dmg_background.tiff" \
         --window-pos 200 120 \
         --window-size 600 400 \
         --icon-size 100 \

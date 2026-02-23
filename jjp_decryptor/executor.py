@@ -8,6 +8,14 @@ import threading
 # Prevent console windows from flashing when launched via pythonw.exe on Windows
 _CREATE_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
+# Ensure common tool locations are on PATH (PyInstaller bundles get a minimal PATH)
+if sys.platform == "darwin":
+    _extra = ["/usr/local/bin", "/opt/homebrew/bin", "/opt/homebrew/sbin"]
+    _path = os.environ.get("PATH", "")
+    _missing = [p for p in _extra if p not in _path.split(os.pathsep)]
+    if _missing:
+        os.environ["PATH"] = os.pathsep.join([_path] + _missing)
+
 # Docker image/container names
 _DOCKER_IMAGE = "jjp-decryptor"
 _DOCKER_CONTAINER = "jjp-decryptor-worker"

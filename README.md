@@ -65,6 +65,8 @@ Download from the [Releases page](https://github.com/davidvanderburgh/jjp-decryp
 
 **Windows installer note**: When prompted, check **Install prerequisites** to set up WSL2, partclone, and xorriso. If WSL2 was just enabled, reboot and re-run the prerequisites installer from the Start Menu.
 
+**macOS note**: Docker Desktop must be installed and running. The app auto-builds a lightweight Alpine container with partclone and xorriso on first run.
+
 The app checks for updates automatically on startup and will notify you when a new version is available.
 
 ### Option 2: Run from Source
@@ -87,7 +89,7 @@ The app checks for updates automatically on startup and will notify you when a n
 ### Decrypting Assets
 
 1. Launch the app
-2. Prerequisites are checked automatically on startup (WSL2, partclone, xorriso)
+2. Prerequisites are checked automatically on startup (Docker on macOS, WSL2 on Windows, native tools on Linux)
 3. Click **Browse** to select your game image (ISO or ext4)
 4. Click **Browse** to select an output folder for decrypted assets
 5. Click **Start Decryption**
