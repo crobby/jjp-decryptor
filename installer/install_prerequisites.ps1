@@ -71,12 +71,12 @@ try {
 
 if (-not $wslAvailable) {
     Write-Host "  WSL2 is not installed or not enabled." -ForegroundColor Yellow
-    $install = Read-Host "  Install WSL2 now? (y/n)"
+    $install = Read-Host "  Install WSL2 with Ubuntu now? (y/n)"
     if ($install -eq 'y') {
-        Write-Host "  Installing WSL2 (this may take a few minutes)..." -ForegroundColor Cyan
-        wsl --install --no-distribution 2>&1 | ForEach-Object { Write-Host "    $_" }
+        Write-Host "  Installing WSL2 with Ubuntu (this may take several minutes)..." -ForegroundColor Cyan
+        wsl --install -d Ubuntu 2>&1 | ForEach-Object { Write-Host "    $_" }
         $needsReboot = $true
-        Write-Installed "WSL2 (reboot required)"
+        Write-Installed "WSL2 + Ubuntu (reboot required)"
     } else {
         Write-SKIP "WSL2"
     }
