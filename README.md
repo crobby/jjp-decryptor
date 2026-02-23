@@ -1,6 +1,6 @@
 # JJP Asset Decryptor
 
-A Windows GUI application for decrypting and modifying game assets on Jersey Jack Pinball (JJP) machines. The encryption algorithm has been fully reverse-engineered — **no USB dongle required**. Turns a complex multi-step process involving filesystem extraction, cryptographic decryption, and ISO rebuilding into a single button click.
+A cross-platform GUI application for decrypting and modifying game assets on Jersey Jack Pinball (JJP) machines. Runs on Windows, macOS, and Linux. The encryption algorithm has been fully reverse-engineered — **no USB dongle required**. Turns a complex multi-step process involving filesystem extraction, cryptographic decryption, and ISO rebuilding into a single button click.
 
 ## What It Does
 
@@ -106,10 +106,13 @@ After decrypting, you can replace game assets and re-encrypt them:
 
 ### Installing on the Machine
 
-1. Write the `_modified.iso` to a USB drive using [Rufus](https://rufus.ie/)
-   - **Important: Use ISO mode (not DD mode) when Rufus prompts you.** DD mode will not produce a bootable drive for Clonezilla ISOs on JJP hardware.
+1. Write the `_modified.iso` to a USB drive:
+   - **Windows**: Use [Rufus](https://rufus.ie/) — **select ISO mode (not DD mode)** when prompted
+   - **macOS/Linux**: Use [balenaEtcher](https://etcher.balena.io/) or `dd`
 2. Boot the pinball machine from the USB drive
 3. Clonezilla restores the image automatically
+
+Detailed instructions: [Windows (PDF)](https://marketing.jerseyjackpinball.com/general/install-full/JJP_USB_UPDATE_PC_instructions.pdf) | [Mac (PDF)](https://marketing.jerseyjackpinball.com/general/install-full/JJP_USB_UPDATE_MAC_instructions.pdf)
 
 ### File Format Notes
 
@@ -183,8 +186,8 @@ flowchart LR
         ISO2[Clonezilla ISO] --> MOD
         MOD --> MISO[Modified ISO]
     end
-    MISO --> RUFUS[Rufus - USB]
-    RUFUS --> MACHINE[Pinball Machine]
+    MISO --> FLASH[Flash to USB]
+    FLASH --> MACHINE[Pinball Machine]
 ```
 
 ### Decrypt Pipeline
@@ -198,16 +201,16 @@ flowchart TD
     E --> F[Done]
 
     B -.- B1["ISO → gunzip → partclone.restore → raw ext4"]
-    C -.- C1["Loop-mount ext4 image in WSL2"]
-    D -.- D1["Deploy crypto.py to WSL\nScan filesystem, detect filler sizes\nXOR-decrypt each file directly to output folder\nGenerate fl_decrypted.dat and .checksums.md5"]
+    C -.- C1["Loop-mount ext4 image"]
+    D -.- D1["Deploy crypto.py\nScan filesystem, detect filler sizes\nXOR-decrypt each file directly to output folder\nGenerate fl_decrypted.dat and .checksums.md5"]
     E -.- E1["Unmount ext4 and ISO\nDelete raw image from /tmp"]
 ```
 
 | Phase | What Happens |
 |-------|-------------|
 | **Extract** | Decompresses Clonezilla ISO's partclone image to raw ext4 |
-| **Mount** | Loop-mounts the ext4 image read-only in WSL2 |
-| **Decrypt** | Deploys `crypto.py` and `filelist.py` to WSL, scans the encrypted filesystem, auto-detects filler sizes, XOR-decrypts every file directly to the Windows output folder, and generates `fl_decrypted.dat` + `.checksums.md5` |
+| **Mount** | Loop-mounts the ext4 image read-only (via WSL2, Docker, or native depending on platform) |
+| **Decrypt** | Deploys `crypto.py` and `filelist.py`, scans the encrypted filesystem, auto-detects filler sizes, XOR-decrypts every file directly to the output folder, and generates `fl_decrypted.dat` + `.checksums.md5` |
 | **Cleanup** | Unmounts ext4 and ISO images, deletes the raw image from `/tmp` |
 
 ### Modify Pipeline
@@ -244,7 +247,8 @@ flowchart TD
 
 ### FILE CHECK ERROR on the machine
 If the machine shows errors for ALL files after flashing:
-- Ensure the ISO was written with Rufus in **ISO mode** (not DD mode)
+- **Windows**: Ensure the ISO was written with Rufus in **ISO mode** (not DD mode)
+- **macOS/Linux**: Ensure the ISO was written with balenaEtcher or `dd` (not a drag-and-drop file copy)
 - Check that the compression flags match the original (`pigz --fast -b 1024 --rsyncable`)
 
 ### Stale mounts from a previous crash
@@ -261,28 +265,35 @@ wsl -u root -- rm -f /tmp/jjp_raw_*.img
 
 ## Building the Installer
 
-To build the installer from source, you need [Inno Setup 6](https://jrsoftware.org/isinfo.php) installed.
+### Windows
+
+Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php).
 
 ```powershell
 cd installer
 powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 ```
 
-The build script:
-1. Downloads a Python embeddable distribution with tkinter support
-2. Reads the version from `jjp_decryptor/__init__.py`
-3. Compiles the Inno Setup installer
-
 Output: `installer/Output/JJP_Asset_Decryptor_Setup_v<version>.exe`
+
+### macOS
+
+Requires Python 3.10+ with tkinter and PyInstaller.
+
+```bash
+bash installer/build_macos.sh
+```
+
+Output: `installer/Output/JJP_Asset_Decryptor_v<version>.dmg`
 
 ### Versioning
 
 The version number lives in `jjp_decryptor/__init__.py` as `__version__`. To release a new version:
 
 1. Bump `__version__` in `jjp_decryptor/__init__.py`
-2. Run `installer/build.ps1` to build the installer
+2. Build installers: `installer/build.ps1` (Windows) and/or `installer/build_macos.sh` (macOS)
 3. Commit, tag `v<version>`, push
-4. Create a GitHub release and attach the installer `.exe`
+4. Create a GitHub release and attach the installer(s)
 
 Users running older versions will see an update notification on their next launch.
 

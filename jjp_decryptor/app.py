@@ -374,7 +374,7 @@ class App:
                 "The selected image is not an ISO file.\n\n"
                 "Modify Assets can still encrypt your changes, but the output "
                 "will be a raw .img file instead of a bootable Clonezilla ISO.\n\n"
-                "For a Rufus-writable ISO, select the original Clonezilla ISO.\n\n"
+                "For a flashable ISO, select the original Clonezilla ISO.\n\n"
                 "Continue anyway?")
             if not proceed:
                 return

@@ -3,6 +3,7 @@
 import base64
 import re
 import subprocess
+import sys
 import time
 import uuid
 
@@ -1388,18 +1389,38 @@ class ModPipeline(DecryptionPipeline):
 
                 self.log("", "info")
                 self.log("=== Next Steps ===", "info")
-                self.log(
-                    "1. Write this ISO to a USB drive using Rufus\n"
-                    "   Important: select ISO mode (NOT DD mode) when prompted\n"
-                    "2. Boot the pinball machine from USB\n"
-                    "3. Let Clonezilla restore the image to the machine",
-                    "info",
-                )
-                self.log_link(
-                    "JJP USB Update Instructions (PDF)",
-                    "https://marketing.jerseyjackpinball.com/general/install-full/"
-                    "JJP_USB_UPDATE_PC_instructions.pdf",
-                )
+                if sys.platform == "win32":
+                    self.log(
+                        "1. Write this ISO to a USB drive using Rufus\n"
+                        "   Important: select ISO mode (NOT DD mode) when prompted\n"
+                        "2. Boot the pinball machine from USB\n"
+                        "3. Let Clonezilla restore the image to the machine",
+                        "info",
+                    )
+                    self.log_link(
+                        "JJP USB Update Instructions (PDF)",
+                        "https://marketing.jerseyjackpinball.com/general/install-full/"
+                        "JJP_USB_UPDATE_PC_instructions.pdf",
+                    )
+                else:
+                    self.log(
+                        "1. Write this ISO to a USB drive using balenaEtcher or dd\n"
+                        "2. Boot the pinball machine from USB\n"
+                        "3. Let Clonezilla restore the image to the machine",
+                        "info",
+                    )
+                    if sys.platform == "darwin":
+                        self.log_link(
+                            "JJP USB Update Instructions for Mac (PDF)",
+                            "https://marketing.jerseyjackpinball.com/general/install-full/"
+                            "JJP_USB_UPDATE_MAC_instructions.pdf",
+                        )
+                    else:
+                        self.log_link(
+                            "JJP USB Update Instructions (PDF)",
+                            "https://marketing.jerseyjackpinball.com/general/install-full/"
+                            "JJP_USB_UPDATE_PC_instructions.pdf",
+                        )
             else:
                 # Fallback for non-ISO inputs: output the raw .img
                 import os
@@ -2576,18 +2597,38 @@ class StandaloneModPipeline(ModPipeline):
                     f"Modified ISO at:\n{win_path}")
                 self.log("", "info")
                 self.log("=== Next Steps ===", "info")
-                self.log(
-                    "1. Write this ISO to a USB drive using Rufus\n"
-                    "   Important: select ISO mode (NOT DD mode) when prompted\n"
-                    "2. Boot the pinball machine from USB\n"
-                    "3. Let Clonezilla restore the image to the machine",
-                    "info",
-                )
-                self.log_link(
-                    "JJP USB Update Instructions (PDF)",
-                    "https://marketing.jerseyjackpinball.com/general/install-full/"
-                    "JJP_USB_UPDATE_PC_instructions.pdf",
-                )
+                if sys.platform == "win32":
+                    self.log(
+                        "1. Write this ISO to a USB drive using Rufus\n"
+                        "   Important: select ISO mode (NOT DD mode) when prompted\n"
+                        "2. Boot the pinball machine from USB\n"
+                        "3. Let Clonezilla restore the image to the machine",
+                        "info",
+                    )
+                    self.log_link(
+                        "JJP USB Update Instructions (PDF)",
+                        "https://marketing.jerseyjackpinball.com/general/install-full/"
+                        "JJP_USB_UPDATE_PC_instructions.pdf",
+                    )
+                else:
+                    self.log(
+                        "1. Write this ISO to a USB drive using balenaEtcher or dd\n"
+                        "2. Boot the pinball machine from USB\n"
+                        "3. Let Clonezilla restore the image to the machine",
+                        "info",
+                    )
+                    if sys.platform == "darwin":
+                        self.log_link(
+                            "JJP USB Update Instructions for Mac (PDF)",
+                            "https://marketing.jerseyjackpinball.com/general/install-full/"
+                            "JJP_USB_UPDATE_MAC_instructions.pdf",
+                        )
+                    else:
+                        self.log_link(
+                            "JJP USB Update Instructions (PDF)",
+                            "https://marketing.jerseyjackpinball.com/general/install-full/"
+                            "JJP_USB_UPDATE_PC_instructions.pdf",
+                        )
             else:
                 img_name = (self._raw_img_path.rsplit("/", 1)[-1]
                             if self._raw_img_path else "image")

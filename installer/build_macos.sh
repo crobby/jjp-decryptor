@@ -35,9 +35,9 @@ pyinstaller \
     --name "JJP Asset Decryptor" \
     --windowed \
     --icon "$SCRIPT_DIR/build/icon.icns" \
-    --add-data "jjp_decryptor/icon.png:jjp_decryptor" \
-    --add-data "jjp_decryptor/Dockerfile:jjp_decryptor" \
-    --add-data "partclone_to_raw.py:." \
+    --add-data "$ROOT_DIR/jjp_decryptor/icon.png:jjp_decryptor" \
+    --add-data "$ROOT_DIR/jjp_decryptor/Dockerfile:jjp_decryptor" \
+    --add-data "$ROOT_DIR/partclone_to_raw.py:." \
     --noconfirm \
     --clean \
     --distpath "$SCRIPT_DIR/build/dist" \
