@@ -12,15 +12,10 @@ JJP pinball machines store encrypted game assets (images, videos, audio, fonts) 
 
 ## Supported Games
 
-Confirmed working (26,000+ files decrypted across all four):
-
 - Willy Wonka & the Chocolate Factory
 - Guns N' Roses
 - Elton John
 - The Hobbit
-
-Not yet tested (but should work — same platform and encryption scheme):
-
 - Wizard of Oz
 - Dialed In
 - Toy Story
