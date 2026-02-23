@@ -302,7 +302,17 @@ def create_ico(filename, sizes=(16, 32, 48, 64, 256)):
 
 if __name__ == "__main__":
     import os
-    icon_path = os.path.join(os.path.dirname(__file__), "jjp_decryptor", "icon.ico")
+    base_dir = os.path.join(os.path.dirname(__file__), "jjp_decryptor")
+    icon_path = os.path.join(base_dir, "icon.ico")
+    png_path = os.path.join(base_dir, "icon.png")
     print("Generating JJP Asset Decryptor icon...")
     create_ico(icon_path)
+
+    # Also generate a 256x256 PNG for non-Windows platforms
+    print("  Rendering 256x256 PNG...")
+    rgba = render_icon(256)
+    png_data = create_png(256, 256, rgba)
+    with open(png_path, "wb") as f:
+        f.write(png_data)
+    print(f"  PNG saved to: {png_path}")
     print("Done!")

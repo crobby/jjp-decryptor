@@ -13,11 +13,20 @@ from .pipeline import (DecryptionPipeline, ModPipeline,
                         StandaloneDecryptPipeline, StandaloneModPipeline,
                         check_prerequisites)
 from .updater import check_for_update
-from .wsl import WslExecutor
+from .executor import create_executor
+import sys
 
-# Settings file location
-_SETTINGS_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
-                              "jjp_decryptor")
+# Settings file location — platform-aware
+if sys.platform == "win32":
+    _SETTINGS_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
+                                  "jjp_decryptor")
+elif sys.platform == "darwin":
+    _SETTINGS_DIR = os.path.join(os.path.expanduser("~/Library/Application Support"),
+                                  "jjp_decryptor")
+else:
+    _SETTINGS_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME",
+                                  os.path.expanduser("~/.config")),
+                                  "jjp_decryptor")
 _SETTINGS_FILE = os.path.join(_SETTINGS_DIR, "settings.json")
 
 
@@ -59,7 +68,7 @@ class App:
         self.root = tk.Tk()
         self.msg_queue = queue.Queue()
         self.pipeline = None
-        self.wsl = WslExecutor()
+        self.executor = create_executor()
         self._active_mode = "decrypt"  # "decrypt" or "modify"
 
         # Pre-load theme preference (needed before window creation)
@@ -108,9 +117,18 @@ class App:
         self.root.mainloop()
 
     def _on_close(self):
-        """Handle window close — offer to free cached images in WSL /tmp."""
+        """Handle window close — offer to free cached images."""
+        from .executor import DockerExecutor
+        # Determine cache location label for the message
+        if sys.platform == "win32":
+            cache_label = "WSL"
+        elif sys.platform == "darwin":
+            cache_label = "Docker"
+        else:
+            cache_label = "/tmp"
+
         try:
-            result = self.wsl.run(
+            result = self.executor.run(
                 "find /tmp -maxdepth 1 -name 'jjp_raw_*' -type f "
                 "-printf '%f %s\\n' 2>/dev/null",
                 timeout=5,
@@ -131,7 +149,7 @@ class App:
                     names = "\n".join(f"/tmp/{f}" for f in files)
                     answer = messagebox.askyesnocancel(
                         "Free Disk Space?",
-                        f"There are cached game images in WSL using "
+                        f"There are cached game images in {cache_label} using "
                         f"{size_gb:.1f} GB of disk space:\n\n"
                         f"{names}\n\n"
                         f"Would you like to delete them to free up space?\n\n"
@@ -142,13 +160,20 @@ class App:
                     if answer is None:
                         return  # Cancel — don't close
                     if answer:
-                        self.wsl.run(
+                        self.executor.run(
                             "find /tmp -maxdepth 1 -name 'jjp_raw_*' -type f "
                             "-delete 2>/dev/null; true",
                             timeout=30,
                         )
         except Exception:
-            pass  # Don't block close if WSL is unavailable
+            pass  # Don't block close if executor is unavailable
+
+        # Stop Docker container on exit if applicable
+        if isinstance(self.executor, DockerExecutor):
+            try:
+                self.executor.stop_container()
+            except Exception:
+                pass
 
         self._save_settings()
         self.root.destroy()
@@ -212,7 +237,7 @@ class App:
         self.window.append_log("Checking prerequisites...", "info")
 
         def _run():
-            results = check_prerequisites(self.wsl, standalone=True)
+            results = check_prerequisites(self.executor, standalone=True)
             for name, passed, message in results:
                 self.msg_queue.put(LogMsg(
                     f"  {name}: {'OK' if passed else 'MISSING'} - {message}",
@@ -451,38 +476,46 @@ class App:
         import glob as globmod
 
         def _run():
-            files_to_remove = []  # list of (wsl_path, display_name)
+            files_to_remove = []  # list of (exec_path, display_name)
 
-            # Check WSL /tmp/ for leftover images
+            # Determine cache location label
+            if sys.platform == "win32":
+                cache_label = "WSL /tmp/"
+            elif sys.platform == "darwin":
+                cache_label = "Docker /tmp/"
+            else:
+                cache_label = "/tmp/"
+
+            # Check executor /tmp/ for leftover images
             try:
-                result = self.wsl.run(
+                result = self.executor.run(
                     "find /tmp -maxdepth 1 -name 'jjp_raw_*' -type f 2>/dev/null",
                     timeout=10,
                 )
                 for f in result.strip().split("\n"):
                     f = f.strip()
                     if f:
-                        files_to_remove.append((f, f.split("/")[-1] + " (WSL /tmp/)"))
+                        files_to_remove.append(
+                            (f, f.split("/")[-1] + f" ({cache_label})"))
             except Exception:
                 pass
 
             # Check output folder for .img files
             output_path = self.window.output_var.get().strip()
             if output_path:
-                for win_path in globmod.glob(os.path.join(output_path, "jjp_raw_*.img")):
-                    from .wsl import win_to_wsl
-                    wsl_path = win_to_wsl(win_path)
+                for host_path in globmod.glob(os.path.join(output_path, "jjp_raw_*.img")):
+                    exec_path = self.executor.to_exec_path(host_path)
                     files_to_remove.append(
-                        (wsl_path, os.path.basename(win_path) + " (output folder)"))
+                        (exec_path, os.path.basename(host_path) + " (output folder)"))
 
             if not files_to_remove:
                 self.msg_queue.put(LogMsg("No cached images found.", "info"))
                 return
 
             total_size = 0
-            for wsl_path, _ in files_to_remove:
+            for exec_path, _ in files_to_remove:
                 try:
-                    sz = self.wsl.run(f"stat -c%s '{wsl_path}'", timeout=5).strip()
+                    sz = self.executor.run(f"stat -c%s '{exec_path}'", timeout=5).strip()
                     total_size += int(sz)
                 except Exception:
                     pass
@@ -493,9 +526,9 @@ class App:
                 "info",
             ))
 
-            for wsl_path, display in files_to_remove:
+            for exec_path, display in files_to_remove:
                 try:
-                    self.wsl.run(f"rm -f '{wsl_path}'", timeout=30)
+                    self.executor.run(f"rm -f '{exec_path}'", timeout=30)
                     self.msg_queue.put(LogMsg(f"  Removed: {display}", "info"))
                 except Exception:
                     self.msg_queue.put(LogMsg(f"  Failed to remove: {display}", "error"))
@@ -510,7 +543,7 @@ class App:
         def _run():
             try:
                 from . import config
-                result = self.wsl.run(
+                result = self.executor.run(
                     f"findmnt -rn -o TARGET | grep '{config.MOUNT_PREFIX}'",
                     timeout=10,
                 )
@@ -524,21 +557,21 @@ class App:
                 ))
 
                 # Unmount all in reverse order (submounts before parents)
-                self.wsl.run(
+                self.executor.run(
                     f"findmnt -rn -o TARGET | grep '{config.MOUNT_PREFIX}' | sort -r | "
                     f"xargs -r -I{{}} umount -lf '{{}}' 2>/dev/null; true",
                     timeout=30,
                 )
 
                 # Remove empty mount directories
-                self.wsl.run(
+                self.executor.run(
                     f"find /mnt -maxdepth 1 -name 'jjp_*' -type d -empty -delete 2>/dev/null; true",
                     timeout=10,
                 )
 
                 # Detach any stale loop devices
                 try:
-                    loops = self.wsl.run(
+                    loops = self.executor.run(
                         "losetup -a 2>/dev/null | grep jjp_raw",
                         timeout=10,
                     ).strip()
@@ -547,7 +580,7 @@ class App:
                         if line:
                             loop_dev = line.split(":")[0]
                             try:
-                                self.wsl.run(f"losetup -d '{loop_dev}' 2>/dev/null; true", timeout=5)
+                                self.executor.run(f"losetup -d '{loop_dev}' 2>/dev/null; true", timeout=5)
                             except Exception:
                                 pass
                 except Exception:

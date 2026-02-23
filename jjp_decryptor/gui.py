@@ -1,11 +1,25 @@
 """Main window GUI for JJP Asset Decryptor."""
 
+import sys
 import tkinter as tk
 from tkinter import ttk, filedialog
 import time
 import webbrowser
 
 from . import config
+
+
+def _platform_font():
+    """Return (sans_font, mono_font) appropriate for the current platform."""
+    if sys.platform == "win32":
+        return "Segoe UI", "Consolas"
+    elif sys.platform == "darwin":
+        return "SF Pro Text", "Menlo"
+    else:
+        return "sans-serif", "monospace"
+
+
+_SANS_FONT, _MONO_FONT = _platform_font()
 
 # Color schemes for dark and light modes
 _THEMES = {
@@ -72,7 +86,7 @@ class _Tooltip:
         self._tip.wm_geometry(f"+{x}+{y}")
         label = tk.Label(self._tip, text=self.text, background=c["tooltip_bg"],
                          foreground=c["tooltip_fg"], relief="solid", borderwidth=1,
-                         font=("Segoe UI", 9), padx=6, pady=2)
+                         font=(_SANS_FONT, 9), padx=6, pady=2)
         label.pack()
 
     def _hide(self, event=None):
@@ -104,12 +118,22 @@ class MainWindow:
 
         # Set window icon
         import os
-        icon_path = os.path.join(os.path.dirname(__file__), "icon.ico")
-        if os.path.isfile(icon_path):
-            try:
-                root.iconbitmap(icon_path)
-            except tk.TclError:
-                pass
+        if sys.platform == "win32":
+            icon_path = os.path.join(os.path.dirname(__file__), "icon.ico")
+            if os.path.isfile(icon_path):
+                try:
+                    root.iconbitmap(icon_path)
+                except tk.TclError:
+                    pass
+        else:
+            icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
+            if os.path.isfile(icon_path):
+                try:
+                    icon_img = tk.PhotoImage(file=icon_path)
+                    root.iconphoto(True, icon_img)
+                    self._icon_img = icon_img  # prevent GC
+                except tk.TclError:
+                    pass
 
         # State
         self._start_time = None
@@ -122,18 +146,41 @@ class MainWindow:
 
     @staticmethod
     def _detect_system_theme():
-        """Detect the Windows system theme (dark or light)."""
-        try:
-            import winreg
-            key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-            )
-            value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
-            winreg.CloseKey(key)
-            return "light" if value else "dark"
-        except Exception:
-            return "light"
+        """Detect the system theme (dark or light) on any platform."""
+        if sys.platform == "win32":
+            try:
+                import winreg
+                key = winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                )
+                value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                winreg.CloseKey(key)
+                return "light" if value else "dark"
+            except Exception:
+                return "light"
+        elif sys.platform == "darwin":
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["defaults", "read", "-g", "AppleInterfaceStyle"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                return "dark" if "Dark" in result.stdout else "light"
+            except Exception:
+                return "light"
+        else:
+            # Linux — try gsettings (GNOME)
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["gsettings", "get", "org.gnome.desktop.interface",
+                     "color-scheme"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                return "dark" if "dark" in result.stdout.lower() else "light"
+            except Exception:
+                return "light"
 
     def _apply_theme(self, theme):
         """Apply dark or light theme to all widgets."""
@@ -157,16 +204,17 @@ class MainWindow:
                   background=[("active", c["accent"]), ("pressed", c["accent"])],
                   foreground=[("active", "#ffffff"), ("pressed", "#ffffff")])
         _icon_base = {"background": c["bg"], "borderwidth": 0, "relief": "flat"}
-        style.configure("Sun.TButton", font=("Segoe UI", 14), padding=(4, 0),
+        style.configure("Sun.TButton", font=(_SANS_FONT, 14), padding=(4, 0),
                          foreground="#e6a817", **_icon_base)
         style.map("Sun.TButton", background=[("active", c["button"])])
-        style.configure("Moon.TButton", font=("Segoe UI", 14), padding=(4, 0),
+        style.configure("Moon.TButton", font=(_SANS_FONT, 14), padding=(4, 0),
                          foreground="#7b9fd4", **_icon_base)
         style.map("Moon.TButton", background=[("active", c["button"])])
-        style.configure("Help.TButton", font=("Segoe UI", 11), padding=(4, 0),
+        style.configure("Help.TButton", font=(_SANS_FONT, 11), padding=(4, 0),
                          foreground=c["accent"], **_icon_base)
         style.map("Help.TButton", background=[("active", c["button"])])
-        style.configure("Trash.TButton", font=("Segoe MDL2 Assets", 12), padding=(4, 0),
+        _trash_font = ("Segoe MDL2 Assets", 12) if sys.platform == "win32" else (_SANS_FONT, 12)
+        style.configure("Trash.TButton", font=_trash_font, padding=(4, 0),
                          foreground=c["error"], **_icon_base)
         style.map("Trash.TButton", background=[("active", c["button"])])
         style.configure("TEntry", fieldbackground=c["field_bg"], foreground=c["fg"])
@@ -189,18 +237,19 @@ class MainWindow:
         self.root.configure(bg=c["bg"])
 
         # Windows title bar dark/light mode via DWM API
-        try:
-            import ctypes
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-            dark_value = 1 if theme == "dark" else 0
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                ctypes.byref(ctypes.c_int(dark_value)),
-                ctypes.sizeof(ctypes.c_int),
-            )
-        except Exception:
-            pass
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+                DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+                dark_value = 1 if theme == "dark" else 0
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                    ctypes.byref(ctypes.c_int(dark_value)),
+                    ctypes.sizeof(ctypes.c_int),
+                )
+            except Exception:
+                pass
 
         # Log text widget — always dark background (terminal-style)
         d = _THEMES["dark"]
@@ -260,7 +309,8 @@ class MainWindow:
                                      command=self._toggle_theme)
         self.theme_btn.pack(side=tk.RIGHT, padx=(0, 4))
         self._theme_tooltip = _Tooltip(self.theme_btn, "", lambda: self._current_theme)
-        self.clear_cache_btn = ttk.Button(top_bar, text="\uE74D", width=3,
+        _trash_icon = "\uE74D" if sys.platform == "win32" else "\U0001F5D1"
+        self.clear_cache_btn = ttk.Button(top_bar, text=_trash_icon, width=3,
                                            style="Trash.TButton",
                                            command=self._on_clear_cache)
         self.clear_cache_btn.pack(side=tk.RIGHT, padx=(0, 4))
@@ -320,7 +370,7 @@ class MainWindow:
         self.prereq_grid.pack(fill=tk.X)
 
         self.prereq_labels = {}
-        prereq_names = ["WSL2", "partclone", "xorriso"]
+        prereq_names = config.PREREQ_NAMES
         for i, name in enumerate(prereq_names):
             col = i % 2
             row_idx = i // 2
@@ -406,7 +456,7 @@ class MainWindow:
         log_container.pack(fill=tk.BOTH, expand=True)
 
         self.log_text = tk.Text(log_container, wrap=tk.WORD, state=tk.DISABLED,
-                                font=("Consolas", 9), relief=tk.FLAT, padx=6, pady=4)
+                                font=(_MONO_FONT, 9), relief=tk.FLAT, padx=6, pady=4)
         scrollbar = ttk.Scrollbar(log_container, orient=tk.VERTICAL,
                                    command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scrollbar.set)

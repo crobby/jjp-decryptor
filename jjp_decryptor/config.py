@@ -1,5 +1,7 @@
 """Constants and configuration for JJP Asset Decryptor."""
 
+import sys
+
 # USB dongle identification
 HASP_VID_PID = "0529:0001"
 
@@ -109,3 +111,11 @@ STANDALONE_MOD_PHASES = [
     "Build ISO",
     "Cleanup",
 ]
+
+# Prerequisite names shown in the GUI (platform-aware)
+if sys.platform == "win32":
+    PREREQ_NAMES = ["WSL2", "partclone", "xorriso"]
+elif sys.platform == "darwin":
+    PREREQ_NAMES = ["Docker", "partclone", "xorriso"]
+else:
+    PREREQ_NAMES = ["System", "partclone", "xorriso"]

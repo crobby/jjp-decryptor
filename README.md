@@ -30,31 +30,46 @@ Not yet tested (but should work — same platform and encryption scheme):
 
 ## Requirements
 
+**Game image**: Clonezilla ISO backup or raw ext4 filesystem image — download "full installs" from https://marketing.jerseyjackpinball.com/downloads/
+
+No USB dongle, gcc, or usbipd-win required. No additional Python packages needed (uses only the standard library).
+
+### Windows
 - **Windows 10/11** with WSL2 enabled
 - **WSL2** with Ubuntu (or similar): `wsl --install`
 - **partclone** in WSL: `wsl -u root -- apt install partclone`
 - **xorriso** in WSL: `wsl -u root -- apt install xorriso`
-- **Game image**: Clonezilla ISO backup or raw ext4 filesystem image — download "full installs" from https://marketing.jerseyjackpinball.com/downloads/
 - **Rufus** (for writing modified ISOs to USB): [rufus.ie](https://rufus.ie/)
 
-No USB dongle, gcc, or usbipd-win required. No additional Python packages needed (uses only the standard library).
+### macOS
+- **Docker Desktop**: [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/)
+- The app auto-builds a lightweight Alpine container with partclone/xorriso on first run
+- **balenaEtcher** (for writing modified ISOs to USB): [etcher.balena.io](https://etcher.balena.io/)
 
-**Windows only.** The tool relies on WSL2 for Linux filesystem operations.
+### Linux
+- **partclone**: `sudo apt install partclone`
+- **xorriso**: `sudo apt install xorriso`
+- **pigz**: `sudo apt install pigz`
+- Requires `sudo` for loop-mounting ext4 images
+- **dd** or **balenaEtcher** for writing modified ISOs to USB
 
 ## Installation
 
-### Option 1: Installer (Recommended)
+### Option 1: Pre-built Package (Recommended)
 
-1. Download `JJP_Asset_Decryptor_Setup.exe` from the [Releases page](https://github.com/davidvanderburgh/jjp-decryptor/releases)
-2. Run the installer — it includes a bundled Python runtime (no Python installation needed)
-3. When prompted, check **Install prerequisites** to set up WSL2, partclone, and xorriso
-4. If WSL2 was just enabled, reboot and re-run the prerequisites installer from the Start Menu: **JJP Asset Decryptor > Install Prerequisites**
+Download from the [Releases page](https://github.com/davidvanderburgh/jjp-decryptor/releases):
+
+- **Windows**: `JJP_Asset_Decryptor_Setup.exe` — includes bundled Python runtime
+- **macOS**: `JJP_Asset_Decryptor.dmg` — drag to Applications
+- **Linux**: `JJP_Asset_Decryptor.AppImage` — make executable and run
+
+**Windows installer note**: When prompted, check **Install prerequisites** to set up WSL2, partclone, and xorriso. If WSL2 was just enabled, reboot and re-run the prerequisites installer from the Start Menu.
 
 The app checks for updates automatically on startup and will notify you when a new version is available.
 
 ### Option 2: Run from Source
 
-1. Install [Python 3.10+](https://www.python.org/downloads/) (Windows)
+1. Install [Python 3.10+](https://www.python.org/downloads/)
 2. Clone the repository:
    ```
    git clone https://github.com/davidvanderburgh/jjp-decryptor.git
@@ -65,7 +80,7 @@ The app checks for updates automatically on startup and will notify you when a n
    ```
    python -m jjp_decryptor
    ```
-   You can also double-click `JJP Asset Decryptor.pyw` to launch without a console window, or run `create_shortcut.bat` to create a desktop shortcut.
+   On Windows, you can also double-click `JJP Asset Decryptor.pyw` to launch without a console window, or run `create_shortcut.bat` to create a desktop shortcut.
 
 ## Usage
 
@@ -115,7 +130,8 @@ jjp_decryptor/
 ├── filelist.py      # fl.dat parser/generator and filesystem scanner
 ├── resources.py     # Embedded C sources (legacy dongle-based hooks, kept for reference)
 ├── config.py        # Constants (paths, timeouts, known games, phase names)
-├── wsl.py           # WSL2 command executor and Windows↔WSL path conversion
+├── executor.py      # Platform-aware command executor (WSL/Docker/Native)
+├── wsl.py           # Backward-compat wrapper (imports from executor.py)
 └── updater.py       # Auto-update checker (GitHub releases API)
 ```
 

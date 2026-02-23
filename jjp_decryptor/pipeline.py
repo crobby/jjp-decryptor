@@ -8,7 +8,7 @@ import uuid
 
 from . import config
 from .resources import DECRYPT_C_SOURCE, ENCRYPT_C_SOURCE, STUB_C_SOURCE
-from .wsl import WslError, WslExecutor, find_usbipd, win_to_wsl
+from .executor import CommandError, create_executor, find_usbipd
 
 
 # Python script deployed to WSL for standalone decryption.
@@ -149,7 +149,7 @@ class DecryptionPipeline:
         self.on_progress = progress_cb
         self.on_done = done_cb
 
-        self.wsl = WslExecutor()
+        self.executor = create_executor()
         self.mount_point = None
         self.game_name = None
         self.cancelled = False
@@ -161,7 +161,7 @@ class DecryptionPipeline:
     def cancel(self):
         """Request cancellation. Safe to call from any thread."""
         self.cancelled = True
-        self.wsl.kill()
+        self.executor.kill()
 
     def _check_cancel(self):
         if self.cancelled:
@@ -237,26 +237,26 @@ class DecryptionPipeline:
 
         # Delete any stale image from a previous run
         try:
-            self.wsl.run(
+            self.executor.run(
                 f"rm -f '{self._raw_img_path}' 2>/dev/null; true",
                 timeout=10,
             )
-        except WslError:
+        except CommandError:
             pass
 
         self.log("Extracting ext4 filesystem from ISO...", "info")
-        wsl_iso = win_to_wsl(self.image_path)
+        wsl_iso = self.executor.to_exec_path(self.image_path)
         tag = uuid.uuid4().hex[:8]
         self._iso_mount = f"/tmp/jjp_iso_{tag}"
 
         # Mount the ISO
         try:
-            self.wsl.run(f"mkdir -p {self._iso_mount}", timeout=10)
-            self.wsl.run(
+            self.executor.run(f"mkdir -p {self._iso_mount}", timeout=10)
+            self.executor.run(
                 f"mount -o loop,ro '{wsl_iso}' {self._iso_mount}",
                 timeout=config.MOUNT_TIMEOUT,
             )
-        except WslError as e:
+        except CommandError as e:
             raise PipelineError("Extract",
                 f"Failed to mount ISO: {e.output}") from e
 
@@ -266,11 +266,11 @@ class DecryptionPipeline:
         partimag = f"{self._iso_mount}{config.PARTIMAG_PATH}"
         part_prefix = f"{partimag}/{config.GAME_PARTITION}.ext4-ptcl-img.gz"
         try:
-            parts_out = self.wsl.run(
+            parts_out = self.executor.run(
                 f"ls -1 {part_prefix}.* 2>/dev/null | sort",
                 timeout=10,
             )
-        except WslError:
+        except CommandError:
             parts_out = ""
 
         parts = [p.strip() for p in parts_out.strip().split("\n") if p.strip()]
@@ -282,9 +282,9 @@ class DecryptionPipeline:
         total_size = 0
         for p in parts:
             try:
-                sz = self.wsl.run(f"stat -c%s '{p}'", timeout=5).strip()
+                sz = self.executor.run(f"stat -c%s '{p}'", timeout=5).strip()
                 total_size += int(sz)
-            except (WslError, ValueError):
+            except (CommandError, ValueError):
                 pass
 
         self.log(
@@ -308,21 +308,21 @@ class DecryptionPipeline:
             self.log("Python converter not found, trying partclone.restore...", "info")
             has_partclone = False
             try:
-                self.wsl.run("which partclone.restore", timeout=5)
+                self.executor.run("which partclone.restore", timeout=5)
                 has_partclone = True
-            except WslError:
+            except CommandError:
                 pass
 
             if not has_partclone:
                 self.log("Installing partclone (one-time setup)...", "info")
                 try:
-                    self.wsl.run(
+                    self.executor.run(
                         "DEBIAN_FRONTEND=noninteractive apt-get install -y partclone 2>&1",
                         timeout=120,
                     )
                     has_partclone = True
                     self.log("partclone installed.", "success")
-                except WslError:
+                except CommandError:
                     pass
 
             if has_partclone:
@@ -335,10 +335,10 @@ class DecryptionPipeline:
 
         # Verify the output
         try:
-            sz = self.wsl.run(f"stat -c%s '{self._raw_img_path}'", timeout=5).strip()
+            sz = self.executor.run(f"stat -c%s '{self._raw_img_path}'", timeout=5).strip()
             size_gb = int(sz) / (1024**3)
             self.log(f"Extraction complete: {size_gb:.1f} GB raw image.", "success")
-        except WslError as e:
+        except CommandError as e:
             raise PipelineError("Extract",
                 f"Raw image was not created: {e.output}") from e
 
@@ -356,9 +356,9 @@ class DecryptionPipeline:
 
         last_pct = -1
         try:
-            for line in self.wsl.stream(cmd, timeout=config.EXTRACT_TIMEOUT):
+            for line in self.executor.stream(cmd, timeout=config.EXTRACT_TIMEOUT):
                 if self.cancelled:
-                    self.wsl.kill()
+                    self.executor.kill()
                     raise PipelineError("Extract", "Cancelled by user.")
                 # partclone outputs progress with ANSI escapes like:
                 # "Elapsed: 00:00:08, Remaining: 00:01:17, Completed:   9.33%,   3.71GB/min,"
@@ -385,11 +385,11 @@ class DecryptionPipeline:
                     "Block size", "error", "Error", "done", "Starting"
                 ]):
                     self.log(f"  {clean}", "info")
-        except WslError as e:
+        except CommandError as e:
             # partclone may exit non-zero but still produce valid output
             try:
-                self.wsl.run(f"test -s '{self._raw_img_path}'", timeout=5)
-            except WslError:
+                self.executor.run(f"test -s '{self._raw_img_path}'", timeout=5)
+            except CommandError:
                 raise PipelineError("Extract",
                     f"partclone.restore failed: {e.output}") from e
 
@@ -398,7 +398,7 @@ class DecryptionPipeline:
         # block_count * block_size bytes. Read the expected size from the
         # ext4 superblock and extend the file if needed.
         try:
-            sb_info = self.wsl.run(
+            sb_info = self.executor.run(
                 f"dumpe2fs -h '{self._raw_img_path}' 2>/dev/null | "
                 f"grep -E '^Block (count|size):'",
                 timeout=15,
@@ -412,17 +412,17 @@ class DecryptionPipeline:
                     sb_bsize = int(sb_line.split(":")[1].strip())
             if sb_blocks and sb_bsize:
                 expected_size = sb_blocks * sb_bsize
-                actual = int(self.wsl.run(
+                actual = int(self.executor.run(
                     f"stat -c%s '{self._raw_img_path}'", timeout=5).strip())
                 if actual < expected_size:
                     self.log(
                         f"Extending image to full filesystem size "
                         f"({expected_size / (1024**3):.1f} GB)...", "info")
-                    self.wsl.run(
+                    self.executor.run(
                         f"truncate -s {expected_size} '{self._raw_img_path}'",
                         timeout=30,
                     )
-        except (WslError, ValueError):
+        except (CommandError, ValueError):
             pass  # If we can't extend, mount will fail with a clear error
 
     def _extract_with_python(self, parts, script_path=None):
@@ -433,14 +433,14 @@ class DecryptionPipeline:
             script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             script_path = os.path.join(script_dir, "partclone_to_raw.py")
 
-        wsl_script = win_to_wsl(script_path)
+        wsl_script = self.executor.to_exec_path(script_path)
         parts_str = " ".join(f"'{p}'" for p in parts)
         cmd = f"PYTHONUNBUFFERED=1 python3 '{wsl_script}' '{self._raw_img_path}' {parts_str} 2>&1"
 
         try:
-            for line in self.wsl.stream(cmd, timeout=config.EXTRACT_TIMEOUT):
+            for line in self.executor.stream(cmd, timeout=config.EXTRACT_TIMEOUT):
                 if self.cancelled:
-                    self.wsl.kill()
+                    self.executor.kill()
                     raise PipelineError("Extract", "Cancelled by user.")
                 self.log(f"  {line.strip()}", "info")
                 if "Progress:" in line:
@@ -448,7 +448,7 @@ class DecryptionPipeline:
                     if m:
                         pct = float(m.group(1))
                         self.on_progress(int(pct), 100, "Extracting filesystem...")
-        except WslError as e:
+        except CommandError as e:
             raise PipelineError("Extract",
                 f"Python extraction failed: {e.output}") from e
 
@@ -460,7 +460,7 @@ class DecryptionPipeline:
         if self._raw_img_path:
             wsl_img = self._raw_img_path
         else:
-            wsl_img = win_to_wsl(self.image_path)
+            wsl_img = self.executor.to_exec_path(self.image_path)
 
         # Clean up stale mounts and loop devices from previous runs
         self._cleanup_stale_mounts(wsl_img)
@@ -469,13 +469,13 @@ class DecryptionPipeline:
         self.mount_point = f"{config.MOUNT_PREFIX}{tag}"
 
         try:
-            self.wsl.run(f"mkdir -p {self.mount_point}", timeout=10)
-            self.wsl.run(
+            self.executor.run(f"mkdir -p {self.mount_point}", timeout=10)
+            self.executor.run(
                 f"mount -o loop '{wsl_img}' {self.mount_point}",
                 timeout=config.MOUNT_TIMEOUT,
             )
             self.log(f"Mounted at {self.mount_point}", "success")
-        except WslError as e:
+        except CommandError as e:
             # If this was a cached image, it may be corrupt — delete and re-extract
             if self._raw_img_path and self._is_iso():
                 self.log(
@@ -483,12 +483,12 @@ class DecryptionPipeline:
                     "info",
                 )
                 try:
-                    self.wsl.run(f"rmdir '{self.mount_point}' 2>/dev/null; true", timeout=5)
-                except WslError:
+                    self.executor.run(f"rmdir '{self.mount_point}' 2>/dev/null; true", timeout=5)
+                except CommandError:
                     pass
                 try:
-                    self.wsl.run(f"rm -f '{self._raw_img_path}'", timeout=10)
-                except WslError:
+                    self.executor.run(f"rm -f '{self._raw_img_path}'", timeout=10)
+                except CommandError:
                     pass
 
                 # Re-run extraction from scratch
@@ -504,13 +504,13 @@ class DecryptionPipeline:
                 tag = uuid.uuid4().hex[:8]
                 self.mount_point = f"{config.MOUNT_PREFIX}{tag}"
                 try:
-                    self.wsl.run(f"mkdir -p {self.mount_point}", timeout=10)
-                    self.wsl.run(
+                    self.executor.run(f"mkdir -p {self.mount_point}", timeout=10)
+                    self.executor.run(
                         f"mount -o loop '{wsl_img}' {self.mount_point}",
                         timeout=config.MOUNT_TIMEOUT,
                     )
                     self.log(f"Mounted at {self.mount_point}", "success")
-                except WslError as e2:
+                except CommandError as e2:
                     raise PipelineError("Mount",
                         f"Failed to mount freshly extracted image: {e2.output}") from e2
             else:
@@ -521,23 +521,23 @@ class DecryptionPipeline:
         """Clean up stale mount points and loop devices from previous runs."""
         # Find and unmount all jjp mount points (reverse order: submounts first)
         try:
-            self.wsl.run(
+            self.executor.run(
                 f"findmnt -rn -o TARGET | grep '{config.MOUNT_PREFIX}' | sort -r | "
                 f"xargs -r -I{{}} umount -lf '{{}}' 2>/dev/null; true",
                 timeout=30,
             )
             # Remove empty mount directories
-            self.wsl.run(
+            self.executor.run(
                 f"find /mnt -maxdepth 1 -name 'jjp_*' -type d -empty -delete 2>/dev/null; true",
                 timeout=10,
             )
             self.log("Cleaned up stale mounts.", "info")
-        except WslError:
+        except CommandError:
             pass
 
         # Detach any stale loop devices for this image
         try:
-            loops = self.wsl.run(
+            loops = self.executor.run(
                 f"losetup -j '{wsl_img}' 2>/dev/null",
                 timeout=10,
             ).strip()
@@ -549,10 +549,10 @@ class DecryptionPipeline:
                 loop_dev = line.split(":")[0]
                 self.log(f"Detaching stale loop device: {loop_dev}", "info")
                 try:
-                    self.wsl.run(f"losetup -d '{loop_dev}' 2>/dev/null; true", timeout=5)
-                except WslError:
+                    self.executor.run(f"losetup -d '{loop_dev}' 2>/dev/null; true", timeout=5)
+                except CommandError:
                     pass
-        except WslError:
+        except CommandError:
             pass
 
     # --- Phase 2: Detect game + chroot ---
@@ -561,11 +561,11 @@ class DecryptionPipeline:
         self.log("Scanning for game...", "info")
 
         try:
-            result = self.wsl.run(
+            result = self.executor.run(
                 f"ls -1 {self.mount_point}{config.GAME_BASE_PATH}/",
                 timeout=15,
             )
-        except WslError as e:
+        except CommandError as e:
             raise PipelineError("Chroot",
                 f"No JJP game found at {config.GAME_BASE_PATH}/. "
                 "Is this a valid JJP filesystem image?") from e
@@ -578,9 +578,9 @@ class DecryptionPipeline:
                 continue
             game_path = f"{self.mount_point}{config.GAME_BASE_PATH}/{name}/game"
             try:
-                self.wsl.run(f"test -f '{game_path}'", timeout=5)
+                self.executor.run(f"test -f '{game_path}'", timeout=5)
                 candidates.append(name)
-            except WslError:
+            except CommandError:
                 pass
 
         if not candidates:
@@ -600,20 +600,20 @@ class DecryptionPipeline:
             self.on_progress(idx, total_mounts, f"Mounting {target}")
             chroot_target = f"{self.mount_point}{target}"
             try:
-                self.wsl.run(f"mkdir -p '{chroot_target}'", timeout=5)
-                self.wsl.run(
+                self.executor.run(f"mkdir -p '{chroot_target}'", timeout=5)
+                self.executor.run(
                     f"mountpoint -q '{chroot_target}' 2>/dev/null || "
                     f"mount --bind {target} '{chroot_target}'",
                     timeout=10,
                 )
                 self._bind_mounted.append(target)
-            except WslError as e:
+            except CommandError as e:
                 self.log(f"Warning: bind mount {target} failed: {e.output}", "error")
 
         self.on_progress(total_mounts, total_mounts, "Done")
 
         # Ensure /tmp exists and is writable
-        self.wsl.run(f"mkdir -p {self.mount_point}/tmp && "
+        self.executor.run(f"mkdir -p {self.mount_point}/tmp && "
                      f"chmod 1777 {self.mount_point}/tmp", timeout=5)
 
         self.log("Chroot environment ready.", "success")
@@ -628,7 +628,7 @@ class DecryptionPipeline:
         the dongle moves to a different USB port.
         """
         # Check if already bound by looking at usbipd list output
-        rc, stdout, _ = self.wsl.run_win([usbipd, "list"], timeout=15)
+        rc, stdout, _ = self.executor.run_win([usbipd, "list"], timeout=15)
         if rc != 0:
             return
 
@@ -646,7 +646,7 @@ class DecryptionPipeline:
 
         # Not bound — bind with admin elevation
         self.log("Binding dongle for USB passthrough (requires admin)...", "info")
-        rc, _, stderr = self.wsl.run_win(
+        rc, _, stderr = self.executor.run_win(
             ["powershell", "-Command",
              f"Start-Process '{usbipd}' -ArgumentList "
              f"'bind --hardware-id {config.HASP_VID_PID}' "
@@ -663,7 +663,7 @@ class DecryptionPipeline:
         usbipd = find_usbipd()
 
         # Check dongle on Windows side via usbipd
-        rc, stdout, stderr = self.wsl.run_win(
+        rc, stdout, stderr = self.executor.run_win(
             [usbipd, "list"], timeout=15
         )
         if rc != 0:
@@ -682,14 +682,14 @@ class DecryptionPipeline:
         self._bind_dongle(usbipd)
 
         # Detach first to ensure clean state (previous run may have left it attached)
-        self.wsl.run_win(
+        self.executor.run_win(
             [usbipd, "detach", "--hardware-id", config.HASP_VID_PID],
             timeout=10,
         )
         time.sleep(1)
 
         # Attach to WSL
-        rc, stdout, stderr = self.wsl.run_win(
+        rc, stdout, stderr = self.executor.run_win(
             [usbipd, "attach", "--wsl", "--hardware-id", config.HASP_VID_PID],
             timeout=30,
         )
@@ -697,7 +697,7 @@ class DecryptionPipeline:
             # May need admin elevation
             if "access" in stderr.lower() or "administrator" in stderr.lower():
                 self.log("Requesting admin elevation for USB passthrough...", "info")
-                rc2, _, stderr2 = self.wsl.run_win(
+                rc2, _, stderr2 = self.executor.run_win(
                     ["powershell", "-Command",
                      f"Start-Process '{usbipd}' -ArgumentList "
                      f"'attach --wsl --hardware-id {config.HASP_VID_PID}' "
@@ -714,7 +714,7 @@ class DecryptionPipeline:
                 self.log("Device not shared, retrying bind...", "info")
                 self._bind_dongle(usbipd)
                 time.sleep(1)
-                rc2, _, stderr2 = self.wsl.run_win(
+                rc2, _, stderr2 = self.executor.run_win(
                     [usbipd, "attach", "--wsl", "--hardware-id", config.HASP_VID_PID],
                     timeout=30,
                 )
@@ -737,7 +737,7 @@ class DecryptionPipeline:
             time.sleep(1)
             step += 1
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"lsusb 2>/dev/null | grep -q '{config.HASP_VID_PID}'",
                     timeout=5,
                 )
@@ -745,7 +745,7 @@ class DecryptionPipeline:
                 self.log(f"Dongle visible in WSL (after {i + 1}s).", "success")
                 step = config.USB_SETTLE_TIMEOUT  # skip remaining USB wait
                 break
-            except WslError:
+            except CommandError:
                 if i < config.USB_SETTLE_TIMEOUT - 1:
                     self.log(f"  Not visible yet ({i + 1}s)...", "info")
 
@@ -777,14 +777,14 @@ class DecryptionPipeline:
         self._bind_dongle(usbipd)
 
         # Detach
-        self.wsl.run_win(
+        self.executor.run_win(
             [usbipd, "detach", "--hardware-id", config.HASP_VID_PID],
             timeout=10,
         )
         time.sleep(2)
 
         # Attach
-        rc, stdout, stderr = self.wsl.run_win(
+        rc, stdout, stderr = self.executor.run_win(
             [usbipd, "attach", "--wsl", "--hardware-id", config.HASP_VID_PID],
             timeout=30,
         )
@@ -795,13 +795,13 @@ class DecryptionPipeline:
         for i in range(config.USB_SETTLE_TIMEOUT):
             time.sleep(1)
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"lsusb 2>/dev/null | grep -q '{config.HASP_VID_PID}'",
                     timeout=5,
                 )
                 self.log(f"Dongle visible in WSL (after {i + 1}s).", "success")
                 break
-            except WslError:
+            except CommandError:
                 pass
         else:
             self.log("Warning: Dongle not visible in lsusb after re-attach.", "error")
@@ -825,9 +825,9 @@ class DecryptionPipeline:
 
         # Kill any existing daemon first (both host and chroot)
         try:
-            self.wsl.run("killall hasplmd_x86_64 2>/dev/null; true", timeout=10)
+            self.executor.run("killall hasplmd_x86_64 2>/dev/null; true", timeout=10)
             time.sleep(1)
-        except WslError:
+        except CommandError:
             pass
 
         # Run daemon from WSL host with LD_LIBRARY_PATH pointing into the
@@ -835,20 +835,20 @@ class DecryptionPipeline:
         daemon_bin = f"{mp}{config.HASP_DAEMON_PATH}"
         lib_paths = f"{mp}/usr/lib/x86_64-linux-gnu:{mp}/usr/lib:{mp}/lib/x86_64-linux-gnu:{mp}/lib"
         try:
-            self.wsl.run(
+            self.executor.run(
                 f"LD_LIBRARY_PATH={lib_paths} {daemon_bin} -s 2>&1",
                 timeout=15,
             )
-        except WslError:
+        except CommandError:
             # Fallback: try inside chroot (may work if host approach fails
             # due to glibc version mismatch)
             self.log("Host daemon start failed, trying inside chroot...", "info")
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"chroot {mp} {config.HASP_DAEMON_PATH} -s 2>&1",
                     timeout=15,
                 )
-            except WslError as e:
+            except CommandError as e:
                 raise PipelineError("Dongle",
                     f"Failed to start HASP daemon: {e.output}") from e
 
@@ -862,20 +862,20 @@ class DecryptionPipeline:
             step += 1
             # Check daemon is still running
             try:
-                self.wsl.run("pgrep -f hasplmd", timeout=5)
-            except WslError:
+                self.executor.run("pgrep -f hasplmd", timeout=5)
+            except CommandError:
                 raise PipelineError("Dongle",
                     "HASP daemon died unexpectedly. "
                     "Check that the dongle is properly connected.")
             # Check if daemon is listening on port 1947
             try:
-                self.wsl.run(
+                self.executor.run(
                     "bash -c 'echo > /dev/tcp/127.0.0.1/1947' 2>/dev/null",
                     timeout=3,
                 )
                 daemon_ready = True
                 break
-            except WslError:
+            except CommandError:
                 if attempt < config.DAEMON_READY_TIMEOUT - 1:
                     self.log(f"  Daemon not ready yet ({attempt + 1}s)...", "info")
 
@@ -903,10 +903,10 @@ class DecryptionPipeline:
             ) as tf:
                 tf.write(DECRYPT_C_SOURCE)
                 tmp_win = tf.name
-            wsl_tmp = win_to_wsl(tmp_win)
-            self.wsl.run(f"cp '{wsl_tmp}' {mp}/tmp/jjp_decrypt.c", timeout=15)
+            wsl_tmp = self.executor.to_exec_path(tmp_win)
+            self.executor.run(f"cp '{wsl_tmp}' {mp}/tmp/jjp_decrypt.c", timeout=15)
             os.unlink(tmp_win)
-        except (WslError, OSError) as e:
+        except (CommandError, OSError) as e:
             raise PipelineError("Compile",
                 f"Failed to write C source: {e}") from e
 
@@ -914,19 +914,19 @@ class DecryptionPipeline:
         # avoid glibc version mismatch (host glibc may be newer than chroot's)
         chroot_lib = f"{mp}/lib/x86_64-linux-gnu"
         try:
-            self.wsl.run(
+            self.executor.run(
                 f"gcc -c -fPIC -std=gnu11 -D_FORTIFY_SOURCE=0 -fno-stack-protector "
                 f"-o {mp}/tmp/jjp_decrypt.o {mp}/tmp/jjp_decrypt.c 2>&1",
                 timeout=config.COMPILE_TIMEOUT,
             )
-            self.wsl.run(
+            self.executor.run(
                 f"LIBS='{chroot_lib}/libc.so.6'; "
                 f"[ -f '{chroot_lib}/libdl.so.2' ] && LIBS=\"$LIBS {chroot_lib}/libdl.so.2\"; "
                 f"gcc -shared -nostdlib "
                 f"-o {mp}/tmp/jjp_decrypt.so {mp}/tmp/jjp_decrypt.o $LIBS -lgcc 2>&1",
                 timeout=config.COMPILE_TIMEOUT,
             )
-        except WslError as e:
+        except CommandError as e:
             raise PipelineError("Compile",
                 f"gcc compilation failed: {e.output}\n"
                 "Ensure gcc is installed in WSL: wsl -u root -- apt install gcc") from e
@@ -937,12 +937,12 @@ class DecryptionPipeline:
         self.log("Building stub libraries...", "info")
         stubs_dir = f"{mp}/tmp/stubs"
         # Clean stubs directory first to remove stale stubs from previous runs
-        self.wsl.run(f"rm -rf {stubs_dir}", timeout=5)
-        self.wsl.run(f"mkdir -p {stubs_dir}", timeout=5)
+        self.executor.run(f"rm -rf {stubs_dir}", timeout=5)
+        self.executor.run(f"mkdir -p {stubs_dir}", timeout=5)
 
         # Write stub.c
         stub_b64 = base64.b64encode(STUB_C_SOURCE.encode()).decode()
-        self.wsl.run(
+        self.executor.run(
             f"echo '{stub_b64}' | base64 -d > {stubs_dir}/stub.c",
             timeout=10,
         )
@@ -956,7 +956,7 @@ class DecryptionPipeline:
             self.on_progress(idx, total_sonames, soname)
             # Check if this library already exists in the chroot
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"chroot {mp} /bin/sh -c 'ldconfig -p 2>/dev/null | grep -q {soname} || "
                     f"test -f /usr/lib/{soname} || "
                     f"test -f /usr/lib/x86_64-linux-gnu/{soname} || "
@@ -965,11 +965,11 @@ class DecryptionPipeline:
                 )
                 skipped += 1
                 continue  # Library exists in chroot, don't stub it
-            except WslError:
+            except CommandError:
                 pass  # Library not found, create a stub
 
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"gcc -shared -o {stubs_dir}/{soname} "
                     f"{stubs_dir}/stub.c -Wl,-soname,{soname} -nostdlib -nodefaultlibs "
                     f"2>/dev/null || "
@@ -978,7 +978,7 @@ class DecryptionPipeline:
                     timeout=15,
                 )
                 built += 1
-            except WslError:
+            except CommandError:
                 pass  # Non-critical
 
         self.on_progress(total_sonames, total_sonames, "Done")
@@ -991,7 +991,7 @@ class DecryptionPipeline:
         # Discover dongle/hasp/init symbols for debugging and init sequence
         game_path = f"{mp}{config.GAME_BASE_PATH}/{self.game_name}/game"
         try:
-            result = self.wsl.run(
+            result = self.executor.run(
                 f"nm -D {game_path} 2>/dev/null | grep -iE 'dongle|hasp|crypt|init' "
                 f"| head -30",
                 timeout=15,
@@ -1000,7 +1000,7 @@ class DecryptionPipeline:
                 self.log(f"Game symbols (dongle/hasp/crypt/init):", "info")
                 for line in result.strip().split('\n'):
                     self.log(f"  {line.strip()}", "info")
-        except WslError:
+        except CommandError:
             pass
 
     # --- Phase 5: Decrypt ---
@@ -1045,9 +1045,9 @@ class DecryptionPipeline:
                 r'Total:\s*(\d+)\s+OK:\s*(\d+)\s+Failed:\s*(\d+)\s+Skipped:\s*(\d+)')
 
             try:
-                for line in self.wsl.stream(cmd, timeout=config.DECRYPT_TIMEOUT):
+                for line in self.executor.stream(cmd, timeout=config.DECRYPT_TIMEOUT):
                     if self.cancelled:
-                        self.wsl.kill()
+                        self.executor.kill()
                         raise PipelineError("Decrypt", "Cancelled by user.")
 
                     output_lines.append(line)
@@ -1088,7 +1088,7 @@ class DecryptionPipeline:
                         final_ok = int(m.group(2))
                         final_fail = int(m.group(3))
 
-            except WslError:
+            except CommandError:
                 # Exit code from syscall(SYS_exit_group, 0) may show as non-zero
                 # on some systems. Check if we got BATCH COMPLETE.
                 if final_total > 0:
@@ -1138,21 +1138,21 @@ class DecryptionPipeline:
         self.log("Copying decrypted files to output folder...", "info")
         mp = self.mount_point
         src = f"{mp}/tmp/jjp_decrypted"
-        wsl_out = win_to_wsl(self.output_path)
+        wsl_out = self.executor.to_exec_path(self.output_path)
 
         try:
-            self.wsl.run(f"mkdir -p '{wsl_out}'", timeout=10)
-        except WslError as e:
+            self.executor.run(f"mkdir -p '{wsl_out}'", timeout=10)
+        except CommandError as e:
             raise PipelineError("Copy",
                 f"Failed to create output folder: {e.output}") from e
 
         # Count total files for progress reporting
         try:
-            total_str = self.wsl.run(
+            total_str = self.executor.run(
                 f"find {src} -type f | wc -l", timeout=30,
             ).strip()
             total_files = int(total_str)
-        except (WslError, ValueError):
+        except (CommandError, ValueError):
             total_files = 0
 
         if total_files > 0:
@@ -1162,7 +1162,7 @@ class DecryptionPipeline:
         # Use rsync for per-file progress reporting
         try:
             copied = 0
-            for line in self.wsl.stream(
+            for line in self.executor.stream(
                 f"rsync -a --out-format='%n' {src}/ '{wsl_out}/'",
                 timeout=config.COPY_TIMEOUT,
             ):
@@ -1174,16 +1174,16 @@ class DecryptionPipeline:
                         self.on_progress(copied, total_files, line)
             if total_files > 0:
                 self.on_progress(total_files, total_files, "Copy complete")
-        except WslError as e:
+        except CommandError as e:
             # Fall back to plain cp if rsync is not available
             if "not found" in str(e.output).lower() or "not found" in str(e).lower():
                 self.log("rsync not available, falling back to cp...", "info")
                 try:
-                    self.wsl.run(
+                    self.executor.run(
                         f"cp -r {src}/* '{wsl_out}/'",
                         timeout=config.COPY_TIMEOUT,
                     )
-                except WslError as e2:
+                except CommandError as e2:
                     raise PipelineError("Copy",
                         f"Failed to copy files: {e2.output}") from e2
             else:
@@ -1192,20 +1192,20 @@ class DecryptionPipeline:
 
         # Count files in output
         try:
-            count = self.wsl.run(
+            count = self.executor.run(
                 f"find '{wsl_out}' -type f | wc -l",
                 timeout=30,
             ).strip()
-        except WslError:
+        except CommandError:
             count = "?"
 
         # Get total size
         try:
-            size = self.wsl.run(
+            size = self.executor.run(
                 f"du -sh '{wsl_out}' | cut -f1",
                 timeout=30,
             ).strip()
-        except WslError:
+        except CommandError:
             size = "?"
 
         self.log(f"Copied {count} files ({size}) to output folder.", "success")
@@ -1213,13 +1213,13 @@ class DecryptionPipeline:
         # Generate checksums for future modification comparison
         self.log("Generating checksums for asset tracking...", "info")
         try:
-            self.wsl.run(
+            self.executor.run(
                 f"cd '{wsl_out}' && find . -type f ! -name '.*' ! -name 'fl_decrypted.dat' "
                 f"! -name '*.img' -print0 | xargs -0 md5sum > '.checksums.md5'",
                 timeout=600,
             )
             self.log("Checksums saved to .checksums.md5 in output folder.", "success")
-        except WslError:
+        except CommandError:
             self.log("Warning: Could not generate checksums. "
                      "Asset modification tracking will not be available.", "info")
 
@@ -1233,7 +1233,7 @@ class DecryptionPipeline:
             try:
                 # rsync + delete is more reliable than mv across filesystems
                 last_pct = -1
-                for line in self.wsl.stream(
+                for line in self.executor.stream(
                     f"rsync --info=progress2 --no-inc-recursive --remove-source-files "
                     f"'{self._raw_img_path}' '{dest}'",
                     timeout=config.COPY_TIMEOUT,
@@ -1248,7 +1248,7 @@ class DecryptionPipeline:
                 self.on_progress(100, 100, "Done")
                 win_path = os.path.join(self.output_path, img_name)
                 self.log(f"Game image saved to: {win_path}", "success")
-            except WslError as e:
+            except CommandError as e:
                 self.log(f"Warning: Could not move image to output: {e.output}", "info")
 
     # --- Phase 7: Cleanup ---
@@ -1261,16 +1261,16 @@ class DecryptionPipeline:
 
             # Kill HASP daemon (may be running on host or in chroot)
             try:
-                self.wsl.run(
+                self.executor.run(
                     "killall hasplmd_x86_64 2>/dev/null; true",
                     timeout=10,
                 )
-            except WslError:
+            except CommandError:
                 pass
 
             # Detach USB from WSL (non-critical)
             usbipd = find_usbipd()
-            self.wsl.run_win(
+            self.executor.run_win(
                 [usbipd, "detach", "--hardware-id", config.HASP_VID_PID],
                 timeout=10,
             )
@@ -1278,35 +1278,35 @@ class DecryptionPipeline:
             # Unmount bind mounts in reverse order
             for target in reversed(self._bind_mounted):
                 try:
-                    self.wsl.run(f"umount -l '{mp}{target}' 2>/dev/null; true", timeout=10)
-                except WslError:
+                    self.executor.run(f"umount -l '{mp}{target}' 2>/dev/null; true", timeout=10)
+                except CommandError:
                     pass
 
             # Unmount the ext4 image
             try:
-                self.wsl.run(f"umount -l '{mp}' 2>/dev/null; true", timeout=30)
-            except WslError:
+                self.executor.run(f"umount -l '{mp}' 2>/dev/null; true", timeout=30)
+            except CommandError:
                 pass
 
             # Remove mount point
             try:
-                self.wsl.run(f"rmdir '{mp}' 2>/dev/null; true", timeout=5)
-            except WslError:
+                self.executor.run(f"rmdir '{mp}' 2>/dev/null; true", timeout=5)
+            except CommandError:
                 pass
 
         # Clean up ISO mount if we used one
         if self._iso_mount:
             try:
-                self.wsl.run(f"umount -l '{self._iso_mount}' 2>/dev/null; true", timeout=15)
-                self.wsl.run(f"rmdir '{self._iso_mount}' 2>/dev/null; true", timeout=5)
-            except WslError:
+                self.executor.run(f"umount -l '{self._iso_mount}' 2>/dev/null; true", timeout=15)
+                self.executor.run(f"rmdir '{self._iso_mount}' 2>/dev/null; true", timeout=5)
+            except CommandError:
                 pass
 
         # Clean up any leftover raw image in /tmp (it was moved to output folder)
         if self._raw_img_path and self._raw_img_path.startswith("/tmp/"):
             try:
-                self.wsl.run(f"rm -f '{self._raw_img_path}' 2>/dev/null; true", timeout=10)
-            except WslError:
+                self.executor.run(f"rm -f '{self._raw_img_path}' 2>/dev/null; true", timeout=10)
+            except CommandError:
                 pass
 
         self.log("Cleanup complete.", "success")
@@ -1404,7 +1404,7 @@ class ModPipeline(DecryptionPipeline):
                 # Fallback for non-ISO inputs: output the raw .img
                 import os
                 img_name = self._raw_img_path.rsplit("/", 1)[-1] if self._raw_img_path else "image"
-                wsl_out = win_to_wsl(self.assets_folder)
+                wsl_out = self.executor.to_exec_path(self.assets_folder)
                 dest = f"{wsl_out}/{img_name}"
                 win_path = os.path.join(self.assets_folder, img_name)
 
@@ -1412,7 +1412,7 @@ class ModPipeline(DecryptionPipeline):
                     self.log("Moving modified image to output folder...", "info")
                     try:
                         last_pct = -1
-                        for line in self.wsl.stream(
+                        for line in self.executor.stream(
                             f"rsync --info=progress2 --no-inc-recursive --remove-source-files "
                             f"'{self._raw_img_path}' '{dest}'",
                             timeout=config.COPY_TIMEOUT,
@@ -1425,7 +1425,7 @@ class ModPipeline(DecryptionPipeline):
                                     last_pct = pct
                                     self.on_progress(pct, 100, line.strip())
                         self.on_progress(100, 100, "Done")
-                    except WslError as e:
+                    except CommandError as e:
                         self.log(f"Warning: Could not move image to output: {e.output}", "info")
 
                 self.log(f"Modified image ready at: {win_path}", "success")
@@ -1459,9 +1459,9 @@ class ModPipeline(DecryptionPipeline):
         cache_path = self._raw_img_cache_path()
         self.log("Clearing cached image to ensure fresh extraction...", "info")
         try:
-            self.wsl.run(
+            self.executor.run(
                 f"rm -f '{cache_path}' 2>/dev/null; true", timeout=30)
-        except WslError:
+        except CommandError:
             pass
 
         # Extract fresh from the original ISO
@@ -1560,28 +1560,28 @@ class ModPipeline(DecryptionPipeline):
             ) as tf:
                 tf.write(ENCRYPT_C_SOURCE)
                 tmp_win = tf.name
-            wsl_tmp = win_to_wsl(tmp_win)
-            self.wsl.run(f"cp '{wsl_tmp}' {mp}/tmp/jjp_encrypt.c", timeout=15)
+            wsl_tmp = self.executor.to_exec_path(tmp_win)
+            self.executor.run(f"cp '{wsl_tmp}' {mp}/tmp/jjp_encrypt.c", timeout=15)
             os.unlink(tmp_win)
-        except (WslError, OSError) as e:
+        except (CommandError, OSError) as e:
             raise PipelineError("Compile",
                 f"Failed to write C source: {e}") from e
 
         chroot_lib = f"{mp}/lib/x86_64-linux-gnu"
         try:
-            self.wsl.run(
+            self.executor.run(
                 f"gcc -c -fPIC -std=gnu11 -D_FORTIFY_SOURCE=0 -fno-stack-protector "
                 f"-o {mp}/tmp/jjp_encrypt.o {mp}/tmp/jjp_encrypt.c 2>&1",
                 timeout=config.COMPILE_TIMEOUT,
             )
-            self.wsl.run(
+            self.executor.run(
                 f"LIBS='{chroot_lib}/libc.so.6'; "
                 f"[ -f '{chroot_lib}/libdl.so.2' ] && LIBS=\"$LIBS {chroot_lib}/libdl.so.2\"; "
                 f"gcc -shared -nostdlib "
                 f"-o {mp}/tmp/jjp_encrypt.so {mp}/tmp/jjp_encrypt.o $LIBS -lgcc 2>&1",
                 timeout=config.COMPILE_TIMEOUT,
             )
-        except WslError as e:
+        except CommandError as e:
             raise PipelineError("Compile",
                 f"gcc compilation failed: {e.output}") from e
 
@@ -1590,11 +1590,11 @@ class ModPipeline(DecryptionPipeline):
         # Build stub libraries (same as decrypt pipeline)
         self.log("Building stub libraries...", "info")
         stubs_dir = f"{mp}/tmp/stubs"
-        self.wsl.run(f"rm -rf {stubs_dir}", timeout=5)
-        self.wsl.run(f"mkdir -p {stubs_dir}", timeout=5)
+        self.executor.run(f"rm -rf {stubs_dir}", timeout=5)
+        self.executor.run(f"mkdir -p {stubs_dir}", timeout=5)
 
         stub_b64 = base64.b64encode(STUB_C_SOURCE.encode()).decode()
-        self.wsl.run(
+        self.executor.run(
             f"echo '{stub_b64}' | base64 -d > {stubs_dir}/stub.c",
             timeout=10,
         )
@@ -1605,7 +1605,7 @@ class ModPipeline(DecryptionPipeline):
         for idx, soname in enumerate(config.STUB_SONAMES):
             self.on_progress(idx, total_sonames, soname)
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"chroot {mp} /bin/sh -c 'ldconfig -p 2>/dev/null | grep -q {soname} || "
                     f"test -f /usr/lib/{soname} || "
                     f"test -f /usr/lib/x86_64-linux-gnu/{soname} || "
@@ -1614,10 +1614,10 @@ class ModPipeline(DecryptionPipeline):
                 )
                 skipped += 1
                 continue
-            except WslError:
+            except CommandError:
                 pass
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"gcc -shared -o {stubs_dir}/{soname} "
                     f"{stubs_dir}/stub.c -Wl,-soname,{soname} -nostdlib -nodefaultlibs "
                     f"2>/dev/null || "
@@ -1626,7 +1626,7 @@ class ModPipeline(DecryptionPipeline):
                     timeout=15,
                 )
                 built += 1
-            except WslError:
+            except CommandError:
                 pass
 
         self.on_progress(total_sonames, total_sonames, "Done")
@@ -1641,19 +1641,19 @@ class ModPipeline(DecryptionPipeline):
         self.log("Preparing modified files...", "info")
         mp = self.mount_point
         repl_dir = f"{mp}/tmp/jjp_replacements"
-        self.wsl.run(f"rm -rf {repl_dir} && mkdir -p {repl_dir}", timeout=10)
+        self.executor.run(f"rm -rf {repl_dir} && mkdir -p {repl_dir}", timeout=10)
 
         # Copy each changed file into the chroot
         manifest_lines = []
         for i, (rel_path, win_path) in enumerate(self.changed_files):
             self._check_cancel()
-            wsl_src = win_to_wsl(win_path)
+            wsl_src = self.executor.to_exec_path(win_path)
             ext = os.path.splitext(win_path)[1]
             dest_name = f"repl_{i}{ext}"
             dest_path = f"{repl_dir}/{dest_name}"
             try:
-                self.wsl.run(f"cp '{wsl_src}' '{dest_path}'", timeout=60)
-            except WslError as e:
+                self.executor.run(f"cp '{wsl_src}' '{dest_path}'", timeout=60)
+            except CommandError as e:
                 raise PipelineError("Encrypt",
                     f"Failed to copy file: {win_path}\n{e.output}") from e
 
@@ -1663,7 +1663,7 @@ class ModPipeline(DecryptionPipeline):
         # Write manifest
         manifest_content = "\n".join(manifest_lines) + "\n"
         manifest_b64 = base64.b64encode(manifest_content.encode()).decode()
-        self.wsl.run(
+        self.executor.run(
             f"echo '{manifest_b64}' | base64 -d > {mp}/tmp/jjp_manifest.txt",
             timeout=10,
         )
@@ -1706,9 +1706,9 @@ class ModPipeline(DecryptionPipeline):
             fl_dat_failed = False
 
             try:
-                for line in self.wsl.stream(cmd, timeout=config.DECRYPT_TIMEOUT):
+                for line in self.executor.stream(cmd, timeout=config.DECRYPT_TIMEOUT):
                     if self.cancelled:
-                        self.wsl.kill()
+                        self.executor.kill()
                         raise PipelineError("Encrypt", "Cancelled by user.")
 
                     output_lines.append(line)
@@ -1754,7 +1754,7 @@ class ModPipeline(DecryptionPipeline):
                     if fl_failed_re.search(line):
                         fl_dat_failed = True
 
-            except WslError:
+            except CommandError:
                 if final_total > 0:
                     pass
                 elif sentinel_error:
@@ -1820,48 +1820,48 @@ class ModPipeline(DecryptionPipeline):
                 f"{mp}/tmp/stubs",
             ]:
                 try:
-                    self.wsl.run(f"rm -rf '{artifact}' 2>/dev/null; true", timeout=5)
-                except WslError:
+                    self.executor.run(f"rm -rf '{artifact}' 2>/dev/null; true", timeout=5)
+                except CommandError:
                     pass
 
             self.log("Unmounting ext4 for conversion...", "info")
             # Unmount bind mounts first (reverse order)
             for target in reversed(self._bind_mounted):
                 try:
-                    self.wsl.run(
+                    self.executor.run(
                         f"umount -l '{self.mount_point}{target}' 2>/dev/null; true",
                         timeout=10,
                     )
-                except WslError:
+                except CommandError:
                     pass
             self._bind_mounted = []
             # Unmount the ext4
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"umount '{self.mount_point}'", timeout=30)
-            except WslError:
-                self.wsl.run(
+            except CommandError:
+                self.executor.run(
                     f"umount -l '{self.mount_point}' 2>/dev/null; true",
                     timeout=30,
                 )
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"rmdir '{self.mount_point}' 2>/dev/null; true", timeout=5)
-            except WslError:
+            except CommandError:
                 pass
             self.mount_point = None
 
         wsl_img = self._raw_img_path
         self.log("Running e2fsck to repair filesystem metadata...", "info")
         try:
-            for line in self.wsl.stream(
+            for line in self.executor.stream(
                 f"e2fsck -fy '{wsl_img}' 2>&1",
                 timeout=300,
             ):
                 clean = line.strip()
                 if clean:
                     self.log(f"  {clean}", "info")
-        except WslError:
+        except CommandError:
             pass  # e2fsck returns non-zero if it made repairs — that's fine
 
         # Ensure required tools are available
@@ -1869,16 +1869,16 @@ class ModPipeline(DecryptionPipeline):
 
         # Mount the original ISO if not already mounted (extract may have skipped it)
         if not self._iso_mount:
-            wsl_iso = win_to_wsl(self.image_path)
+            wsl_iso = self.executor.to_exec_path(self.image_path)
             tag = uuid.uuid4().hex[:8]
             self._iso_mount = f"/tmp/jjp_iso_{tag}"
             try:
-                self.wsl.run(f"mkdir -p {self._iso_mount}", timeout=10)
-                self.wsl.run(
+                self.executor.run(f"mkdir -p {self._iso_mount}", timeout=10)
+                self.executor.run(
                     f"mount -o loop,ro '{wsl_iso}' {self._iso_mount}",
                     timeout=config.MOUNT_TIMEOUT,
                 )
-            except WslError as e:
+            except CommandError as e:
                 raise PipelineError("Convert",
                     f"Failed to mount original ISO: {e.output}") from e
 
@@ -1886,9 +1886,9 @@ class ModPipeline(DecryptionPipeline):
         partimag = f"{self._iso_mount}{config.PARTIMAG_PATH}"
         part_prefix = f"{partimag}/{config.GAME_PARTITION}.ext4-ptcl-img.gz"
         try:
-            parts_out = self.wsl.run(
+            parts_out = self.executor.run(
                 f"ls -1 {part_prefix}.* 2>/dev/null | sort", timeout=10)
-        except WslError:
+        except CommandError:
             parts_out = ""
         parts = [p.strip() for p in parts_out.strip().split("\n") if p.strip()]
         if not parts:
@@ -1900,10 +1900,10 @@ class ModPipeline(DecryptionPipeline):
         # (JJP originals use 1,000,000,000 bytes, NOT 1 GiB.)
         split_size = "1000000000"
         try:
-            sz = self.wsl.run(
+            sz = self.executor.run(
                 f"stat -c%s '{parts[0]}'", timeout=5).strip()
             split_size = sz  # exact byte count from original first chunk
-        except (WslError, ValueError):
+        except (CommandError, ValueError):
             pass
         self.log(f"Using split size: {split_size} bytes", "info")
 
@@ -1911,9 +1911,9 @@ class ModPipeline(DecryptionPipeline):
         # Use --fast -b 1024 --rsyncable to match the original Clonezilla
         # compression flags, ensuring maximum compatibility.
         try:
-            self.wsl.run("which pigz", timeout=5)
+            self.executor.run("which pigz", timeout=5)
             compressor = "pigz -c --fast -b 1024 --rsyncable"
-        except WslError:
+        except CommandError:
             compressor = "gzip -c --fast --rsyncable"
 
         # Run the conversion pipeline — output to a temp chunks directory.
@@ -1921,7 +1921,7 @@ class ModPipeline(DecryptionPipeline):
         tag = uuid.uuid4().hex[:8]
         self._chunks_dir = f"/tmp/jjp_chunks_{tag}"
         output_prefix = f"{self._chunks_dir}/{config.GAME_PARTITION}.ext4-ptcl-img.gz."
-        self.wsl.run(f"mkdir -p '{self._chunks_dir}'", timeout=10)
+        self.executor.run(f"mkdir -p '{self._chunks_dir}'", timeout=10)
 
         # The raw image may still be mounted — use the path directly
         wsl_img = self._raw_img_path
@@ -1970,7 +1970,7 @@ class ModPipeline(DecryptionPipeline):
         )
         monitor_path = "/tmp/jjp_convert_monitor.sh"
         monitor_b64 = base64.b64encode(monitor_script.encode()).decode()
-        self.wsl.run(
+        self.executor.run(
             f"echo '{monitor_b64}' | base64 -d > {monitor_path} && "
             f"chmod +x {monitor_path}",
             timeout=10,
@@ -1979,11 +1979,11 @@ class ModPipeline(DecryptionPipeline):
         self.log("Starting partclone conversion pipeline...", "info")
         last_pct = -1
         try:
-            for line in self.wsl.stream(
+            for line in self.executor.stream(
                 f"bash {monitor_path}", timeout=config.ISO_CONVERT_TIMEOUT
             ):
                 if self.cancelled:
-                    self.wsl.kill()
+                    self.executor.kill()
                     raise PipelineError("Convert", "Cancelled by user.")
                 clean = line.strip()
                 if not clean:
@@ -1999,23 +1999,23 @@ class ModPipeline(DecryptionPipeline):
                         if ipct % 10 == 0:
                             self.log(f"  Conversion: {ipct}% ({out_mb:.0f} MB written)", "info")
 
-        except WslError as e:
+        except CommandError as e:
             # Try to read the partclone log for details
             log_content = ""
             try:
-                log_content = self.wsl.run(
+                log_content = self.executor.run(
                     "tail -5 /tmp/jjp_ptcl.log 2>/dev/null", timeout=5).strip()
-            except WslError:
+            except CommandError:
                 pass
             raise PipelineError("Convert",
                 f"Partclone conversion failed: {e.output}\n{log_content}") from e
 
         # Verify output files
         try:
-            parts_out = self.wsl.run(
+            parts_out = self.executor.run(
                 f"ls -lh '{output_prefix}'* 2>/dev/null", timeout=10).strip()
             self.log(f"Partclone files created:\n{parts_out}", "success")
-        except WslError:
+        except CommandError:
             raise PipelineError("Convert", "No partclone output files were created.")
 
         self.on_progress(100, 100, "Conversion complete")
@@ -2024,17 +2024,17 @@ class ModPipeline(DecryptionPipeline):
         """Ensure partclone and xorriso are available, installing if needed."""
         for tool, pkg in [("partclone.ext4", "partclone"), ("xorriso", "xorriso")]:
             try:
-                self.wsl.run(f"which {tool}", timeout=10)
+                self.executor.run(f"which {tool}", timeout=10)
                 self.log(f"  {tool}: found", "info")
-            except WslError:
+            except CommandError:
                 self.log(f"  {tool} not found. Installing {pkg}...", "info")
                 try:
-                    self.wsl.run(
+                    self.executor.run(
                         f"DEBIAN_FRONTEND=noninteractive apt-get install -y {pkg} 2>&1",
                         timeout=120,
                     )
                     self.log(f"  {pkg} installed.", "success")
-                except WslError as e:
+                except CommandError as e:
                     raise PipelineError("Convert",
                         f"Failed to install {pkg}: {e.output}\n"
                         f"Run manually: wsl -u root -- apt install {pkg}") from e
@@ -2050,21 +2050,21 @@ class ModPipeline(DecryptionPipeline):
         self.log("Building modified Clonezilla ISO...", "info")
 
         iso_basename = os.path.splitext(os.path.basename(self.image_path))[0]
-        wsl_out = win_to_wsl(self.assets_folder)
+        wsl_out = self.executor.to_exec_path(self.assets_folder)
         output_iso = f"{wsl_out}/{iso_basename}_modified.iso"
-        wsl_iso = win_to_wsl(self.image_path)
+        wsl_iso = self.executor.to_exec_path(self.image_path)
 
         # Enumerate new chunk files produced by _phase_convert
         chunks_dir = self._chunks_dir
         game_part = config.GAME_PARTITION
         partimag = config.PARTIMAG_PATH
         try:
-            chunks_out = self.wsl.run(
+            chunks_out = self.executor.run(
                 f"ls -1 '{chunks_dir}/{game_part}.ext4-ptcl-img.gz.'* "
                 f"2>/dev/null | sort",
                 timeout=10,
             ).strip()
-        except WslError:
+        except CommandError:
             chunks_out = ""
         new_chunks = [c.strip() for c in chunks_out.split("\n") if c.strip()]
         if not new_chunks:
@@ -2104,7 +2104,7 @@ class ModPipeline(DecryptionPipeline):
         )
         script_path = "/tmp/jjp_build_iso.sh"
         script_b64 = base64.b64encode(script.encode()).decode()
-        self.wsl.run(
+        self.executor.run(
             f"echo '{script_b64}' | base64 -d > {script_path} && "
             f"chmod +x {script_path}",
             timeout=10,
@@ -2114,24 +2114,24 @@ class ModPipeline(DecryptionPipeline):
         # contention between the loop mount and xorriso's file access.
         if self._iso_mount:
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"umount -l '{self._iso_mount}' 2>/dev/null; true", timeout=15)
-                self.wsl.run(
+                self.executor.run(
                     f"rmdir '{self._iso_mount}' 2>/dev/null; true", timeout=5)
-            except WslError:
+            except CommandError:
                 pass
             self._iso_mount = None
 
         # Remove existing output ISO — xorriso refuses to write to non-empty -outdev
         try:
-            self.wsl.run(f"rm -f '{output_iso}'", timeout=10)
-        except WslError:
+            self.executor.run(f"rm -f '{output_iso}'", timeout=10)
+        except CommandError:
             pass
 
         self.log("Running xorriso (splicing partition into original ISO)...", "info")
         last_pct = -1
         try:
-            for line in self.wsl.stream(
+            for line in self.executor.stream(
                 f"bash {script_path}", timeout=config.ISO_BUILD_TIMEOUT
             ):
                 self._check_cancel()
@@ -2147,21 +2147,21 @@ class ModPipeline(DecryptionPipeline):
                     if pct > last_pct:
                         last_pct = pct
                         self.on_progress(pct, 100, f"Building ISO: {pct}%")
-        except WslError as e:
+        except CommandError as e:
             try:
-                script_content = self.wsl.run(
+                script_content = self.executor.run(
                     f"cat {script_path}", timeout=5).strip()
                 self.log(f"Build script was:\n{script_content}", "info")
-            except WslError:
+            except CommandError:
                 pass
             raise PipelineError("Build ISO",
                 f"xorriso failed: {e.output}") from e
 
         # Verify output and compare size with original
         try:
-            new_sz = int(self.wsl.run(
+            new_sz = int(self.executor.run(
                 f"stat -c%s '{output_iso}'", timeout=10).strip())
-            orig_sz = int(self.wsl.run(
+            orig_sz = int(self.executor.run(
                 f"stat -c%s '{wsl_iso}'", timeout=10).strip())
             new_gb = new_sz / (1024**3)
             orig_gb = orig_sz / (1024**3)
@@ -2171,7 +2171,7 @@ class ModPipeline(DecryptionPipeline):
                 f"(original: {orig_gb:.2f} GB, diff: {diff_mb:+.1f} MB)",
                 "success",
             )
-        except (WslError, ValueError):
+        except (CommandError, ValueError):
             raise PipelineError("Build ISO", "ISO file was not created.")
 
         self.on_progress(100, 100, "ISO build complete")
@@ -2188,51 +2188,51 @@ class ModPipeline(DecryptionPipeline):
         if self.mount_point:
             mp = self.mount_point
             try:
-                self.wsl.run("killall hasplmd_x86_64 2>/dev/null; true", timeout=10)
-            except WslError:
+                self.executor.run("killall hasplmd_x86_64 2>/dev/null; true", timeout=10)
+            except CommandError:
                 pass
 
             usbipd = find_usbipd()
-            self.wsl.run_win(
+            self.executor.run_win(
                 [usbipd, "detach", "--hardware-id", config.HASP_VID_PID],
                 timeout=10,
             )
 
             for target in reversed(self._bind_mounted):
                 try:
-                    self.wsl.run(f"umount -l '{mp}{target}' 2>/dev/null; true", timeout=10)
-                except WslError:
+                    self.executor.run(f"umount -l '{mp}{target}' 2>/dev/null; true", timeout=10)
+                except CommandError:
                     pass
 
             try:
-                self.wsl.run(f"umount -l '{mp}' 2>/dev/null; true", timeout=30)
-            except WslError:
+                self.executor.run(f"umount -l '{mp}' 2>/dev/null; true", timeout=30)
+            except CommandError:
                 pass
 
             try:
-                self.wsl.run(f"rmdir '{mp}' 2>/dev/null; true", timeout=5)
-            except WslError:
+                self.executor.run(f"rmdir '{mp}' 2>/dev/null; true", timeout=5)
+            except CommandError:
                 pass
 
         if self._iso_mount:
             try:
-                self.wsl.run(f"umount -l '{self._iso_mount}' 2>/dev/null; true", timeout=15)
-                self.wsl.run(f"rmdir '{self._iso_mount}' 2>/dev/null; true", timeout=5)
-            except WslError:
+                self.executor.run(f"umount -l '{self._iso_mount}' 2>/dev/null; true", timeout=15)
+                self.executor.run(f"rmdir '{self._iso_mount}' 2>/dev/null; true", timeout=5)
+            except CommandError:
                 pass
 
         # Clean up temp chunks directory
         if hasattr(self, '_chunks_dir') and self._chunks_dir:
             self.log("Removing temp chunks directory...", "info")
             try:
-                self.wsl.run(f"rm -rf '{self._chunks_dir}'", timeout=60)
-            except WslError:
+                self.executor.run(f"rm -rf '{self._chunks_dir}'", timeout=60)
+            except CommandError:
                 self.log(f"Warning: Could not remove {self._chunks_dir}", "info")
 
         # Clean up partclone log
         try:
-            self.wsl.run("rm -f /tmp/jjp_ptcl.log 2>/dev/null; true", timeout=5)
-        except WslError:
+            self.executor.run("rm -f /tmp/jjp_ptcl.log 2>/dev/null; true", timeout=5)
+        except CommandError:
             pass
 
         self.log("Cleanup complete.", "success")
@@ -2257,8 +2257,15 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
 
     def run(self):
         """Execute the standalone pipeline."""
+        from .executor import DockerExecutor
         cleanup_phase = len(config.STANDALONE_PHASES) - 1
         try:
+            # Start Docker container if on macOS
+            if isinstance(self.executor, DockerExecutor):
+                self.log("Starting Docker container...", "info")
+                self.executor.start_container([
+                    self.image_path, self.output_path])
+
             self.on_phase(0)  # Extract
             self._phase_extract()
             self._check_cancel()
@@ -2294,11 +2301,11 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
         """Detect game name from mount point (simplified, no chroot setup)."""
         self.log("Scanning for game...", "info")
         try:
-            result = self.wsl.run(
+            result = self.executor.run(
                 f"ls -1 {self.mount_point}{config.GAME_BASE_PATH}/",
                 timeout=15,
             )
-        except WslError as e:
+        except CommandError as e:
             raise PipelineError("Mount",
                 f"No JJP game found at {config.GAME_BASE_PATH}/") from e
 
@@ -2308,12 +2315,12 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
                 continue
             game_path = f"{self.mount_point}{config.GAME_BASE_PATH}/{name}/game"
             try:
-                self.wsl.run(f"test -f '{game_path}'", timeout=5)
+                self.executor.run(f"test -f '{game_path}'", timeout=5)
                 self.game_name = name
                 display = config.KNOWN_GAMES.get(name, name)
                 self.log(f"Detected game: {display} ({name})", "success")
                 return
-            except WslError:
+            except CommandError:
                 pass
 
     def _phase_decrypt_standalone(self):
@@ -2330,24 +2337,24 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
         import os
 
         mp = self.mount_point
-        wsl_out = win_to_wsl(self.output_path)
-        self.wsl.run(f"mkdir -p '{wsl_out}'", timeout=10)
+        wsl_out = self.executor.to_exec_path(self.output_path)
+        self.executor.run(f"mkdir -p '{wsl_out}'", timeout=10)
 
         # Deploy crypto module to WSL /tmp
         self.log("Deploying Python crypto module to WSL...", "info")
         pkg_dir = os.path.dirname(os.path.abspath(__file__))
         for module in ("crypto.py", "filelist.py"):
-            src = win_to_wsl(os.path.join(pkg_dir, module))
-            self.wsl.run(f"cp '{src}' /tmp/jjp_{module}", timeout=10)
+            src = self.executor.to_exec_path(os.path.join(pkg_dir, module))
+            self.executor.run(f"cp '{src}' /tmp/jjp_{module}", timeout=10)
 
         has_fl_dat = self.fl_dat_path and os.path.isfile(self.fl_dat_path)
 
         if has_fl_dat:
             # Copy cached fl.dat
-            wsl_fl = win_to_wsl(self.fl_dat_path)
-            self.wsl.run(
+            wsl_fl = self.executor.to_exec_path(self.fl_dat_path)
+            self.executor.run(
                 f"cp '{wsl_fl}' '{wsl_out}/fl_decrypted.dat'", timeout=10)
-            self.wsl.run(
+            self.executor.run(
                 f"cp '{wsl_fl}' /tmp/fl_decrypted.dat", timeout=10)
             self.log("Using cached fl_decrypted.dat", "info")
         else:
@@ -2370,7 +2377,7 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
         # Write script to WSL /tmp
         import base64 as _b64
         script_b64 = _b64.b64encode(script.encode()).decode()
-        self.wsl.run(
+        self.executor.run(
             f"echo '{script_b64}' | base64 -d > /tmp/jjp_decrypt_run.py",
             timeout=10)
 
@@ -2388,9 +2395,9 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
             r'Total:\s*(\d+)\s+OK:\s*(\d+)\s+Failed:\s*(\d+)\s+Skipped:\s*(\d+)')
 
         try:
-            for line in self.wsl.stream(cmd, timeout=config.DECRYPT_TIMEOUT):
+            for line in self.executor.stream(cmd, timeout=config.DECRYPT_TIMEOUT):
                 if self.cancelled:
-                    self.wsl.kill()
+                    self.executor.kill()
                     raise PipelineError("Decrypt", "Cancelled by user.")
 
                 level = "info"
@@ -2419,7 +2426,7 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
 
                 self.log(line, level)
 
-        except WslError as e:
+        except CommandError as e:
             if final_total > 0:
                 pass
             else:
@@ -2438,16 +2445,16 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
         )
 
         # Generate checksums for future modification comparison
-        wsl_out = win_to_wsl(self.output_path)
+        wsl_out = self.executor.to_exec_path(self.output_path)
         self.log("Generating checksums for asset tracking...", "info")
         try:
-            self.wsl.run(
+            self.executor.run(
                 f"cd '{wsl_out}' && find . -type f ! -name '.*' ! -name 'fl_decrypted.dat' "
                 f"! -name '*.img' -print0 | xargs -0 md5sum > '.checksums.md5'",
                 timeout=600,
             )
             self.log("Checksums saved to .checksums.md5 in output folder.", "success")
-        except WslError:
+        except CommandError:
             self.log("Warning: Could not generate checksums. "
                      "Asset modification tracking will not be available.", "info")
 
@@ -2457,33 +2464,41 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
 
         if self.mount_point:
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"umount -l '{self.mount_point}' 2>/dev/null; true",
                     timeout=30)
-            except WslError:
+            except CommandError:
                 pass
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"rmdir '{self.mount_point}' 2>/dev/null; true", timeout=5)
-            except WslError:
+            except CommandError:
                 pass
 
         if self._iso_mount:
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"umount -l '{self._iso_mount}' 2>/dev/null; true",
                     timeout=15)
-                self.wsl.run(
+                self.executor.run(
                     f"rmdir '{self._iso_mount}' 2>/dev/null; true", timeout=5)
-            except WslError:
+            except CommandError:
                 pass
 
         if self._raw_img_path and self._raw_img_path.startswith("/tmp/"):
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"rm -f '{self._raw_img_path}' 2>/dev/null; true",
                     timeout=10)
-            except WslError:
+            except CommandError:
+                pass
+
+        # Stop Docker container if applicable
+        from .executor import DockerExecutor
+        if isinstance(self.executor, DockerExecutor):
+            try:
+                self.executor.stop_container()
+            except Exception:
                 pass
 
         self.log("Cleanup complete.", "success")
@@ -2506,8 +2521,15 @@ class StandaloneModPipeline(ModPipeline):
     def run(self):
         """Execute the standalone mod pipeline."""
         import os
+        from .executor import DockerExecutor
         cleanup_phase = len(config.STANDALONE_MOD_PHASES) - 1
         try:
+            # Start Docker container if on macOS
+            if isinstance(self.executor, DockerExecutor):
+                self.log("Starting Docker container...", "info")
+                self.executor.start_container([
+                    self.image_path, self.assets_folder])
+
             self.on_phase(0)  # Scan
             self._phase_scan()
             self._check_cancel()
@@ -2566,20 +2588,20 @@ class StandaloneModPipeline(ModPipeline):
             else:
                 img_name = (self._raw_img_path.rsplit("/", 1)[-1]
                             if self._raw_img_path else "image")
-                wsl_out = win_to_wsl(self.assets_folder)
+                wsl_out = self.executor.to_exec_path(self.assets_folder)
                 dest = f"{wsl_out}/{img_name}"
                 win_path = os.path.join(self.assets_folder, img_name)
                 if self._raw_img_path and self._raw_img_path != dest:
                     self.log("Moving modified image to output folder...", "info")
                     try:
-                        for line in self.wsl.stream(
+                        for line in self.executor.stream(
                             f"rsync --info=progress2 --no-inc-recursive "
                             f"--remove-source-files "
                             f"'{self._raw_img_path}' '{dest}'",
                             timeout=config.COPY_TIMEOUT,
                         ):
                             self._check_cancel()
-                    except WslError:
+                    except CommandError:
                         pass
                 self.log(f"Modified image ready at: {win_path}", "success")
                 self.on_done(True,
@@ -2603,7 +2625,7 @@ class StandaloneModPipeline(ModPipeline):
         if self._raw_img_path:
             wsl_img = self._raw_img_path
         else:
-            wsl_img = win_to_wsl(self.image_path)
+            wsl_img = self.executor.to_exec_path(self.image_path)
 
         self._cleanup_stale_mounts(wsl_img)
         import uuid as _uuid
@@ -2611,19 +2633,19 @@ class StandaloneModPipeline(ModPipeline):
         self.mount_point = f"{config.MOUNT_PREFIX}{tag}"
 
         try:
-            self.wsl.run(f"mkdir -p {self.mount_point}", timeout=10)
-            self.wsl.run(
+            self.executor.run(f"mkdir -p {self.mount_point}", timeout=10)
+            self.executor.run(
                 f"mount -o loop '{wsl_img}' {self.mount_point}",
                 timeout=config.MOUNT_TIMEOUT,
             )
             self.log(f"Mounted at {self.mount_point}", "success")
-        except WslError as e:
+        except CommandError as e:
             raise PipelineError("Mount",
                 f"Failed to mount image: {e.output}") from e
 
         # Detect game name
         try:
-            result = self.wsl.run(
+            result = self.executor.run(
                 f"ls -1 {self.mount_point}{config.GAME_BASE_PATH}/",
                 timeout=15,
             )
@@ -2634,14 +2656,14 @@ class StandaloneModPipeline(ModPipeline):
                 game_path = (f"{self.mount_point}{config.GAME_BASE_PATH}/"
                              f"{name}/game")
                 try:
-                    self.wsl.run(f"test -f '{game_path}'", timeout=5)
+                    self.executor.run(f"test -f '{game_path}'", timeout=5)
                     self.game_name = name
                     display = config.KNOWN_GAMES.get(name, name)
                     self.log(f"Detected game: {display} ({name})", "success")
                     break
-                except WslError:
+                except CommandError:
                     pass
-        except WslError:
+        except CommandError:
             pass
 
     def _phase_encrypt_standalone(self):
@@ -2727,20 +2749,20 @@ class StandaloneModPipeline(ModPipeline):
                     ) as tf:
                         tf.write(enc_b64)
                         tmp_win = tf.name
-                    wsl_tmp = win_to_wsl(tmp_win)
+                    wsl_tmp = self.executor.to_exec_path(tmp_win)
                     try:
-                        self.wsl.run(
+                        self.executor.run(
                             f"base64 -d '{wsl_tmp}' > '{dest_path}'",
                             timeout=60)
                     finally:
                         os.unlink(tmp_win)
                 else:
-                    self.wsl.run(
+                    self.executor.run(
                         f"echo '{enc_b64}' | base64 -d > '{dest_path}'",
                         timeout=30)
                 self.log(f"[VERIFY OK] {rel_path}", "success")
                 ok += 1
-            except (WslError, OSError) as e:
+            except (CommandError, OSError) as e:
                 self.log(f"[FAIL] {rel_path} (write failed: {e})", "error")
                 fail += 1
 
@@ -2763,44 +2785,44 @@ class StandaloneModPipeline(ModPipeline):
         if self.mount_point:
             self.log("Unmounting ext4 for conversion...", "info")
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"umount '{self.mount_point}'", timeout=30)
-            except WslError:
-                self.wsl.run(
+            except CommandError:
+                self.executor.run(
                     f"umount -l '{self.mount_point}' 2>/dev/null; true",
                     timeout=30)
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"rmdir '{self.mount_point}' 2>/dev/null; true", timeout=5)
-            except WslError:
+            except CommandError:
                 pass
             self.mount_point = None
 
         wsl_img = self._raw_img_path
         self.log("Running e2fsck...", "info")
         try:
-            for line in self.wsl.stream(
+            for line in self.executor.stream(
                 f"e2fsck -fy '{wsl_img}' 2>&1", timeout=300
             ):
                 clean = line.strip()
                 if clean:
                     self.log(f"  {clean}", "info")
-        except WslError:
+        except CommandError:
             pass
 
         self._ensure_iso_tools()
 
         if not self._iso_mount:
-            wsl_iso = win_to_wsl(self.image_path)
+            wsl_iso = self.executor.to_exec_path(self.image_path)
             import uuid as _uuid
             tag = _uuid.uuid4().hex[:8]
             self._iso_mount = f"/tmp/jjp_iso_{tag}"
             try:
-                self.wsl.run(f"mkdir -p {self._iso_mount}", timeout=10)
-                self.wsl.run(
+                self.executor.run(f"mkdir -p {self._iso_mount}", timeout=10)
+                self.executor.run(
                     f"mount -o loop,ro '{wsl_iso}' {self._iso_mount}",
                     timeout=config.MOUNT_TIMEOUT)
-            except WslError as e:
+            except CommandError as e:
                 raise PipelineError("Convert",
                     f"Failed to mount original ISO: {e.output}") from e
 
@@ -2808,9 +2830,9 @@ class StandaloneModPipeline(ModPipeline):
         partimag = f"{self._iso_mount}{config.PARTIMAG_PATH}"
         part_prefix = f"{partimag}/{config.GAME_PARTITION}.ext4-ptcl-img.gz"
         try:
-            parts_out = self.wsl.run(
+            parts_out = self.executor.run(
                 f"ls -1 {part_prefix}.* 2>/dev/null | sort", timeout=10)
-        except WslError:
+        except CommandError:
             parts_out = ""
         parts = [p.strip() for p in parts_out.strip().split("\n") if p.strip()]
         if not parts:
@@ -2819,16 +2841,16 @@ class StandaloneModPipeline(ModPipeline):
 
         split_size = "1000000000"
         try:
-            sz = self.wsl.run(
+            sz = self.executor.run(
                 f"stat -c%s '{parts[0]}'", timeout=5).strip()
             split_size = sz
-        except (WslError, ValueError):
+        except (CommandError, ValueError):
             pass
 
         try:
-            self.wsl.run("which pigz", timeout=5)
+            self.executor.run("which pigz", timeout=5)
             compressor = "pigz -c --fast -b 1024 --rsyncable"
-        except WslError:
+        except CommandError:
             compressor = "gzip -c --fast --rsyncable"
 
         import uuid as _uuid
@@ -2836,7 +2858,7 @@ class StandaloneModPipeline(ModPipeline):
         self._chunks_dir = f"/tmp/jjp_chunks_{tag}"
         output_prefix = (f"{self._chunks_dir}/"
                          f"{config.GAME_PARTITION}.ext4-ptcl-img.gz.")
-        self.wsl.run(f"mkdir -p '{self._chunks_dir}'", timeout=10)
+        self.executor.run(f"mkdir -p '{self._chunks_dir}'", timeout=10)
 
         self.log(f"Converting {wsl_img} to partclone format...", "info")
         self.log("This may take 10-30 minutes depending on image size.", "info")
@@ -2875,7 +2897,7 @@ class StandaloneModPipeline(ModPipeline):
         import base64
         monitor_path = "/tmp/jjp_convert_monitor.sh"
         monitor_b64 = base64.b64encode(monitor_script.encode()).decode()
-        self.wsl.run(
+        self.executor.run(
             f"echo '{monitor_b64}' | base64 -d > {monitor_path} && "
             f"chmod +x {monitor_path}",
             timeout=10)
@@ -2883,11 +2905,11 @@ class StandaloneModPipeline(ModPipeline):
         self.log("Starting partclone conversion pipeline...", "info")
         last_pct = -1
         try:
-            for line in self.wsl.stream(
+            for line in self.executor.stream(
                 f"bash {monitor_path}", timeout=config.ISO_CONVERT_TIMEOUT
             ):
                 if self.cancelled:
-                    self.wsl.kill()
+                    self.executor.kill()
                     raise PipelineError("Convert", "Cancelled by user.")
                 clean = line.strip()
                 if not clean:
@@ -2905,24 +2927,24 @@ class StandaloneModPipeline(ModPipeline):
                             self.log(
                                 f"  Conversion: {ipct}% "
                                 f"({out_mb:.0f} MB written)", "info")
-        except WslError as e:
+        except CommandError as e:
             log_content = ""
             try:
-                log_content = self.wsl.run(
+                log_content = self.executor.run(
                     "tail -5 /tmp/jjp_ptcl.log 2>/dev/null",
                     timeout=5).strip()
-            except WslError:
+            except CommandError:
                 pass
             raise PipelineError("Convert",
                 f"Partclone conversion failed: {e.output}\n"
                 f"{log_content}") from e
 
         try:
-            parts_out = self.wsl.run(
+            parts_out = self.executor.run(
                 f"ls -lh '{output_prefix}'* 2>/dev/null",
                 timeout=10).strip()
             self.log(f"Partclone files created:\n{parts_out}", "success")
-        except WslError:
+        except CommandError:
             raise PipelineError("Convert",
                 "No partclone output files were created.")
 
@@ -2934,70 +2956,121 @@ class StandaloneModPipeline(ModPipeline):
 
         if self.mount_point:
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"umount -l '{self.mount_point}' 2>/dev/null; true",
                     timeout=30)
-            except WslError:
+            except CommandError:
                 pass
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"rmdir '{self.mount_point}' 2>/dev/null; true",
                     timeout=5)
-            except WslError:
+            except CommandError:
                 pass
 
         if self._iso_mount:
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"umount -l '{self._iso_mount}' 2>/dev/null; true",
                     timeout=15)
-                self.wsl.run(
+                self.executor.run(
                     f"rmdir '{self._iso_mount}' 2>/dev/null; true",
                     timeout=5)
-            except WslError:
+            except CommandError:
                 pass
 
         if hasattr(self, '_chunks_dir') and self._chunks_dir:
             try:
-                self.wsl.run(
+                self.executor.run(
                     f"rm -rf '{self._chunks_dir}'", timeout=60)
-            except WslError:
+            except CommandError:
                 pass
 
         try:
-            self.wsl.run(
+            self.executor.run(
                 "rm -f /tmp/jjp_ptcl.log 2>/dev/null; true", timeout=5)
-        except WslError:
+        except CommandError:
             pass
+
+        # Stop Docker container if applicable
+        from .executor import DockerExecutor
+        if isinstance(self.executor, DockerExecutor):
+            try:
+                self.executor.stop_container()
+            except Exception:
+                pass
 
         self.log("Cleanup complete.", "success")
 
 
-def check_prerequisites(wsl, standalone=False):
+def check_prerequisites(executor, standalone=False):
     """Check all prerequisites. Returns list of (name, passed, message) tuples."""
+    import sys as _sys
+    from .executor import WslExecutor, NativeExecutor, DockerExecutor
+
     results = []
 
-    # WSL2
-    try:
-        wsl.run("echo ok", timeout=15)
-        results.append(("WSL2", True, "Available"))
-    except Exception:
-        results.append(("WSL2", False, "WSL2 not available. Install from Microsoft Store."))
+    if isinstance(executor, WslExecutor):
+        # Windows: check WSL2 + tools inside WSL
+        try:
+            executor.run("echo ok", timeout=15)
+            results.append(("WSL2", True, "Available"))
+        except Exception:
+            results.append(("WSL2", False,
+                "WSL2 not available. Install from Microsoft Store."))
 
-    # partclone
-    try:
-        wsl.run("which partclone.ext4", timeout=10)
-        results.append(("partclone", True, "Available"))
-    except Exception:
-        results.append(("partclone", False,
-            "Not installed. Run: wsl -u root -- apt install partclone"))
+        try:
+            executor.run("which partclone.ext4", timeout=10)
+            results.append(("partclone", True, "Available"))
+        except Exception:
+            results.append(("partclone", False,
+                "Not installed. Run: wsl -u root -- apt install partclone"))
 
-    # xorriso
-    try:
-        wsl.run("which xorriso", timeout=10)
-        results.append(("xorriso", True, "Available"))
-    except Exception:
-        results.append(("xorriso", False,
-            "Not installed. Run: wsl -u root -- apt install xorriso"))
+        try:
+            executor.run("which xorriso", timeout=10)
+            results.append(("xorriso", True, "Available"))
+        except Exception:
+            results.append(("xorriso", False,
+                "Not installed. Run: wsl -u root -- apt install xorriso"))
+
+    elif isinstance(executor, DockerExecutor):
+        # macOS: check Docker Desktop
+        ok, msg = executor.check_available()
+        results.append(("Docker", ok, msg))
+
+        if ok:
+            # Check that the image exists or can be built
+            try:
+                executor.start_container()
+                executor.run("echo ok", timeout=15)
+                results.append(("partclone", True, "Available (in container)"))
+                results.append(("xorriso", True, "Available (in container)"))
+                executor.stop_container()
+            except Exception as e:
+                results.append(("partclone", False, f"Container check failed: {e}"))
+                results.append(("xorriso", False, f"Container check failed: {e}"))
+                try:
+                    executor.stop_container()
+                except Exception:
+                    pass
+
+    elif isinstance(executor, NativeExecutor):
+        # Linux: check tools directly
+        ok, msg = executor.check_available()
+        results.append(("System", ok, msg))
+
+        try:
+            executor.run("which partclone.ext4", timeout=10)
+            results.append(("partclone", True, "Available"))
+        except Exception:
+            results.append(("partclone", False,
+                "Not installed. Run: sudo apt install partclone"))
+
+        try:
+            executor.run("which xorriso", timeout=10)
+            results.append(("xorriso", True, "Available"))
+        except Exception:
+            results.append(("xorriso", False,
+                "Not installed. Run: sudo apt install xorriso"))
 
     return results
