@@ -61,6 +61,7 @@ python3 "$ROOT_DIR/installer/generate_dmg_background.py" "$SCRIPT_DIR/build/dmg_
 
 # Create DMG
 echo "Creating DMG..."
+mkdir -p "$SCRIPT_DIR/Output"
 DMG_NAME="JJP_Asset_Decryptor_v${VERSION}.dmg"
 if command -v create-dmg &>/dev/null; then
     create-dmg \
@@ -76,7 +77,6 @@ if command -v create-dmg &>/dev/null; then
         "$APP_PATH"
 else
     echo "create-dmg not found, creating basic DMG with hdiutil..."
-    mkdir -p "$SCRIPT_DIR/Output"
     hdiutil create -srcfolder "$APP_PATH" \
         -volname "JJP Asset Decryptor" \
         -format UDZO \
