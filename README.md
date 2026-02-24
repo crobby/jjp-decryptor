@@ -55,11 +55,18 @@ No USB dongle, gcc, or usbipd-win required. No additional Python packages needed
 Download from the [Releases page](https://github.com/davidvanderburgh/jjp-decryptor/releases):
 
 - **Windows**: `JJP_Asset_Decryptor_Setup.exe` — includes bundled Python runtime
-- **macOS**: `JJP_Asset_Decryptor.dmg` — drag to Applications
+- **macOS**: `JJP_Asset_Decryptor.dmg` — drag to Applications (see macOS note below)
 
 **Windows installer note**: When prompted, check **Install prerequisites** to set up WSL2, partclone, and xorriso. If WSL2 was just enabled, reboot and re-run the prerequisites installer from the Start Menu.
 
-**macOS note**: Docker Desktop must be installed and running. The app auto-builds a lightweight Alpine container with partclone and xorriso on first run.
+**macOS note**: On first launch, macOS will block the app because it is not notarized with Apple. This is a one-time setup:
+
+1. Open the app normally — you'll see a warning that Apple cannot verify it
+2. Go to **System Settings → Privacy & Security**
+3. Scroll down and click **"Open Anyway"** next to the JJP Asset Decryptor message
+4. The app will launch and won't require this again
+
+Docker Desktop must also be installed and running. The app auto-builds a lightweight Alpine container with partclone and xorriso on first run.
 
 The app checks for updates automatically on startup and will notify you when a new version is available.
 
@@ -287,9 +294,9 @@ Output: `installer/Output/JJP_Asset_Decryptor_v<version>.dmg`
 The version number lives in `jjp_decryptor/__init__.py` as `__version__`. To release a new version:
 
 1. Bump `__version__` in `jjp_decryptor/__init__.py`
-2. Build installers: `installer/build.ps1` (Windows) and/or `installer/build_macos.sh` (macOS)
-3. Commit, tag `v<version>`, push
-4. Create a GitHub release and attach the installer(s)
+2. Commit and push
+3. Tag and push: `git tag v<version> && git push origin v<version>`
+4. GitHub Actions builds both installers and attaches them to the release automatically
 
 Users running older versions will see an update notification on their next launch.
 
