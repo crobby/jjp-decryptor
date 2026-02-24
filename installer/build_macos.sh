@@ -51,6 +51,10 @@ APP_PATH="$SCRIPT_DIR/build/dist/JJP Asset Decryptor.app"
 # Bundle Dockerfile inside .app Resources
 cp "$ROOT_DIR/jjp_decryptor/Dockerfile" "$APP_PATH/Contents/Resources/"
 
+# Ad-hoc code sign so macOS doesn't flag the app as "damaged"
+echo "Ad-hoc code signing..."
+codesign --force --deep --sign - "$APP_PATH"
+
 # Generate DMG background with arrow
 echo "Generating DMG background..."
 python3 "$ROOT_DIR/installer/generate_dmg_background.py" "$SCRIPT_DIR/build/dmg_background.tiff"
