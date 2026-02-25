@@ -2679,7 +2679,7 @@ class StandaloneModPipeline(ModPipeline):
         try:
             self.executor.run(f"mkdir -p {self.mount_point}", timeout=10)
             self.executor.run(
-                f"mount -o loop '{wsl_img}' {self.mount_point}",
+                f"mount -o loop,rw '{wsl_img}' {self.mount_point}",
                 timeout=config.MOUNT_TIMEOUT,
             )
             self.log(f"Mounted at {self.mount_point}", "success")
@@ -2784,7 +2784,9 @@ class StandaloneModPipeline(ModPipeline):
             import base64 as _b64
             enc_b64 = _b64.b64encode(encrypted).decode()
             dest_path = f"{mp}{entry.path}"
+            dest_dir = dest_path.rsplit('/', 1)[0]
             try:
+                self.executor.run(f"mkdir -p '{dest_dir}'", timeout=10)
                 if len(enc_b64) > 100000:
                     import tempfile
                     with tempfile.NamedTemporaryFile(
