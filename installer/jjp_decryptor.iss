@@ -53,6 +53,7 @@ Source: "{#PythonDir}\*"; DestDir: "{app}\python"; Flags: recursesubdirs ignorev
 Source: "{#ProjectDir}\jjp_decryptor\__init__.py"; DestDir: "{app}\jjp_decryptor"; Flags: ignoreversion
 Source: "{#ProjectDir}\jjp_decryptor\__main__.py"; DestDir: "{app}\jjp_decryptor"; Flags: ignoreversion
 Source: "{#ProjectDir}\jjp_decryptor\app.py"; DestDir: "{app}\jjp_decryptor"; Flags: ignoreversion
+Source: "{#ProjectDir}\jjp_decryptor\executor.py"; DestDir: "{app}\jjp_decryptor"; Flags: ignoreversion
 Source: "{#ProjectDir}\jjp_decryptor\gui.py"; DestDir: "{app}\jjp_decryptor"; Flags: ignoreversion
 Source: "{#ProjectDir}\jjp_decryptor\pipeline.py"; DestDir: "{app}\jjp_decryptor"; Flags: ignoreversion
 Source: "{#ProjectDir}\jjp_decryptor\config.py"; DestDir: "{app}\jjp_decryptor"; Flags: ignoreversion
