@@ -168,10 +168,16 @@ class WslExecutor(CommandExecutor):
 
 
 class NativeExecutor(CommandExecutor):
-    """Execute commands natively on Linux using sudo."""
+    """Execute commands natively on Linux using sudo (or directly as root)."""
+
+    def _cmd_prefix(self):
+        """Use sudo unless already running as root (e.g. inside Docker)."""
+        if hasattr(os, "getuid") and os.getuid() == 0:
+            return ["bash", "-c"]
+        return ["sudo", "bash", "-c"]
 
     def run(self, bash_cmd, timeout=120):
-        full_cmd = ["sudo", "bash", "-c", bash_cmd]
+        full_cmd = [*self._cmd_prefix(), bash_cmd]
         try:
             result = subprocess.run(
                 full_cmd,
@@ -191,7 +197,7 @@ class NativeExecutor(CommandExecutor):
         return result.stdout
 
     def stream(self, bash_cmd, timeout=600):
-        full_cmd = ["sudo", "bash", "-c", bash_cmd]
+        full_cmd = [*self._cmd_prefix(), bash_cmd]
         proc = subprocess.Popen(
             full_cmd,
             stdout=subprocess.PIPE,
