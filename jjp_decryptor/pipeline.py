@@ -263,8 +263,13 @@ class DecryptionPipeline:
                 timeout=config.MOUNT_TIMEOUT,
             )
         except CommandError as e:
-            raise PipelineError("Extract",
-                f"Failed to mount ISO: {e.output}") from e
+            msg = f"Failed to mount ISO: {e.output}"
+            if "loop device" in (e.output or "").lower():
+                msg += (
+                    "\n\nIf running in Docker, you must use --privileged:\n"
+                    "  docker run --privileged --rm -v ... ghcr.io/davidvanderburgh/jjp-decryptor ..."
+                )
+            raise PipelineError("Extract", msg) from e
 
         self.log("ISO mounted. Looking for game partition image...", "info")
 

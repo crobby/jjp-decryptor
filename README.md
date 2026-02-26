@@ -286,7 +286,7 @@ wsl -u root -- bash -c "findmnt -rn -o TARGET | grep /mnt/jjp_ | sort -r | xargs
 ### Mount fails with "bad superblock"
 This can happen if partclone.restore produces a truncated image. The tool automatically detects and fixes this by reading the ext4 superblock and extending the image to full filesystem size. If it still fails, delete cached images and retry:
 ```
-wsl -u root -- rm -f /tmp/jjp_raw_*.img
+wsl -u root -- rm -f /var/tmp/jjp_raw_*.img
 ```
 
 ## Building the Installer
