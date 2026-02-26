@@ -102,10 +102,17 @@ jobs:
     needs: [build-macos, build-windows, build-docker]
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - name: Download macOS artifact
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          name: macos-dmg
+          path: artifacts/macos-dmg
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: artifacts/windows-installer
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
