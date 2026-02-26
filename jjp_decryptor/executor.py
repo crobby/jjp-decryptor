@@ -69,6 +69,13 @@ class CommandExecutor:
         """
         raise NotImplementedError
 
+    def check_path_accessible(self, host_path):
+        """Verify a host path is accessible from the executor.
+
+        Returns (ok, message).  Base implementation always succeeds.
+        """
+        return True, ""
+
     def run_host(self, args, timeout=60):
         """Run a command on the host OS directly. Returns (returncode, stdout, stderr).
 
@@ -158,6 +165,41 @@ class WslExecutor(CommandExecutor):
             drive = path[0].lower()
             return f"/mnt/{drive}{path[2:]}"
         return path
+
+    def check_path_accessible(self, host_path):
+        """Verify a Windows path is accessible from WSL.
+
+        WSL2 only automounts drives present at WSL startup.  If a drive
+        (e.g. a USB stick) is connected later, /mnt/<drive> exists only
+        as a plain Linux directory — writes there silently go into WSL's
+        virtual filesystem instead of the real Windows drive.
+
+        Returns (ok, message).
+        """
+        path = host_path.replace("\\", "/")
+        if len(path) < 2 or path[1] != ":":
+            return True, ""
+        drive = path[0].lower()
+        mount_point = f"/mnt/{drive}"
+        try:
+            out = self.run(
+                f"findmnt -n -o FSTYPE '{mount_point}' 2>/dev/null",
+                timeout=10,
+            ).strip()
+        except CommandError:
+            out = ""
+        if not out:
+            letter = drive.upper()
+            return False, (
+                f"Drive {letter}: is not accessible from WSL.\n\n"
+                f"WSL only sees drives that were connected when WSL started.  "
+                f"If {letter}: is a USB or external drive that was plugged in "
+                f"after booting, WSL cannot write to it.\n\n"
+                f"Fix: run  wsl --shutdown  in a Windows terminal, then try "
+                f"again (WSL will restart and detect the drive).\n"
+                f"Alternatively, use a folder on C: or another internal drive."
+            )
+        return True, ""
 
     def check_available(self):
         try:

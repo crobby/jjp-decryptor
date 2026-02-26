@@ -176,6 +176,13 @@ class DecryptionPipeline:
         """Execute the full pipeline. Call from a background thread."""
         cleanup_phase = len(config.PHASES) - 1  # last phase is always Cleanup
         try:
+            # Verify paths are accessible from the executor
+            for label, path in [("Game image", self.image_path),
+                                ("Output folder", self.output_path)]:
+                ok, msg = self.executor.check_path_accessible(path)
+                if not ok:
+                    raise PipelineError("Extract", f"{label} path error:\n{msg}")
+
             self.on_phase(0)  # Extract
             self._phase_extract()
             self._check_cancel()
@@ -1343,6 +1350,13 @@ class ModPipeline(DecryptionPipeline):
         import os
         cleanup_phase = len(config.MOD_PHASES) - 1
         try:
+            # Verify paths are accessible from the executor
+            for label, path in [("Game image", self.image_path),
+                                ("Assets folder", self.assets_folder)]:
+                ok, msg = self.executor.check_path_accessible(path)
+                if not ok:
+                    raise PipelineError("Scan", f"{label} path error:\n{msg}")
+
             # Phase 0: Scan for changes (pure Python, no WSL needed)
             self.on_phase(0)
             self._phase_scan()
@@ -2316,6 +2330,13 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
         from .executor import DockerExecutor
         cleanup_phase = len(config.STANDALONE_PHASES) - 1
         try:
+            # Verify both paths are accessible from the executor
+            for label, path in [("Game image", self.image_path),
+                                ("Output folder", self.output_path)]:
+                ok, msg = self.executor.check_path_accessible(path)
+                if not ok:
+                    raise PipelineError("Extract", f"{label} path error:\n{msg}")
+
             # Start Docker container if on macOS
             if isinstance(self.executor, DockerExecutor):
                 self.log("Starting Docker container...", "info")
@@ -2582,6 +2603,13 @@ class StandaloneModPipeline(ModPipeline):
         from .executor import DockerExecutor
         cleanup_phase = len(config.STANDALONE_MOD_PHASES) - 1
         try:
+            # Verify both paths are accessible from the executor
+            for label, path in [("Game image", self.image_path),
+                                ("Assets folder", self.assets_folder)]:
+                ok, msg = self.executor.check_path_accessible(path)
+                if not ok:
+                    raise PipelineError("Scan", f"{label} path error:\n{msg}")
+
             # Start Docker container if on macOS
             if isinstance(self.executor, DockerExecutor):
                 self.log("Starting Docker container...", "info")
