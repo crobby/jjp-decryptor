@@ -85,6 +85,28 @@ The app checks for updates automatically on startup and will notify you when a n
    ```
    On Windows, you can also double-click `JJP Asset Decryptor.pyw` to launch without a console window, or run `create_shortcut.bat` to create a desktop shortcut.
 
+### Option 3: Docker Container
+
+Run the decryptor as a Docker container with zero installation — all dependencies are bundled in the image.
+
+```bash
+# Decrypt game assets
+docker run --privileged --rm \
+  -v /path/to/isos:/data \
+  -v /path/to/output:/output \
+  ghcr.io/davidvanderburgh/jjp-decryptor \
+  decrypt -i /data/game.iso -o /output
+
+# Modify assets and rebuild ISO
+docker run --privileged --rm \
+  -v /path/to/isos:/data \
+  -v /path/to/output:/output \
+  ghcr.io/davidvanderburgh/jjp-decryptor \
+  mod -i /data/game.iso -a /output
+```
+
+`--privileged` is required for loop-mounting filesystem images inside the container. The `-v` flags mount your local directories into the container so it can read the ISO and write output files.
+
 ## Usage
 
 ### Decrypting Assets
@@ -128,7 +150,8 @@ Detailed instructions: [Windows (PDF)](https://marketing.jerseyjackpinball.com/g
 
 ```
 jjp_decryptor/
-├── __main__.py      # Entry point (python -m jjp_decryptor)
+├── __main__.py      # GUI entry point (python -m jjp_decryptor)
+├── cli.py           # CLI entry point for Docker/headless use (python -m jjp_decryptor.cli)
 ├── app.py           # Application controller — wires GUI ↔ pipeline via thread-safe queue
 ├── gui.py           # Tkinter GUI with dark/light theme, tabs, progress tracking
 ├── pipeline.py      # StandaloneDecryptPipeline and StandaloneModPipeline
