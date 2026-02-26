@@ -253,7 +253,7 @@ class DecryptionPipeline:
         self.log("Extracting ext4 filesystem from ISO...", "info")
         wsl_iso = self.executor.to_exec_path(self.image_path)
         tag = uuid.uuid4().hex[:8]
-        self._iso_mount = f"/tmp/jjp_iso_{tag}"
+        self._iso_mount = f"/var/tmp/jjp_iso_{tag}"
 
         # Mount the ISO
         try:
@@ -1906,11 +1906,20 @@ class ModPipeline(DecryptionPipeline):
         # Ensure required tools are available
         self._ensure_iso_tools()
 
-        # Mount the original ISO if not already mounted (extract may have skipped it)
+        # Mount the original ISO if not already mounted, or re-mount if
+        # the previous mount was cleaned up (e.g. by systemd-tmpfiles-clean).
+        if self._iso_mount:
+            try:
+                self.executor.run(
+                    f"mountpoint -q '{self._iso_mount}'", timeout=5)
+            except CommandError:
+                self.log("ISO mount disappeared, re-mounting...", "info")
+                self._iso_mount = None
+
         if not self._iso_mount:
             wsl_iso = self.executor.to_exec_path(self.image_path)
             tag = uuid.uuid4().hex[:8]
-            self._iso_mount = f"/tmp/jjp_iso_{tag}"
+            self._iso_mount = f"/var/tmp/jjp_iso_{tag}"
             try:
                 self.executor.run(f"mkdir -p {self._iso_mount}", timeout=10)
                 self.executor.run(
@@ -1958,7 +1967,7 @@ class ModPipeline(DecryptionPipeline):
         # Run the conversion pipeline — output to a temp chunks directory.
         # The build phase will splice these into the original ISO.
         tag = uuid.uuid4().hex[:8]
-        self._chunks_dir = f"/tmp/jjp_chunks_{tag}"
+        self._chunks_dir = f"/var/tmp/jjp_chunks_{tag}"
         output_prefix = f"{self._chunks_dir}/{config.GAME_PARTITION}.ext4-ptcl-img.gz."
         self.executor.run(f"mkdir -p '{self._chunks_dir}'", timeout=10)
 
@@ -1975,7 +1984,7 @@ class ModPipeline(DecryptionPipeline):
         # buffering on the stderr redirect.
         convert_cmd = (
             f"set -o pipefail && "
-            f"partclone.ext4 -c -s '{wsl_img}' -o - 2> >(stdbuf -oL tr '\\r' '\\n' > /tmp/jjp_ptcl.log) "
+            f"partclone.ext4 -c -s '{wsl_img}' -o - 2> >(stdbuf -oL tr '\\r' '\\n' > /var/tmp/jjp_ptcl.log) "
             f"| {compressor} "
             f"| split -b {split_size} -a 2 - '{output_prefix}'"
         )
@@ -1989,7 +1998,7 @@ class ModPipeline(DecryptionPipeline):
             f"while kill -0 $PID 2>/dev/null; do\n"
             f"  sleep 3\n"
             f"  # Extract latest progress from partclone log\n"
-            f"  PCT=$(grep -oP 'Completed:\\s*\\K[\\d.]+' /tmp/jjp_ptcl.log 2>/dev/null | tail -1)\n"
+            f"  PCT=$(grep -oP 'Completed:\\s*\\K[\\d.]+' /var/tmp/jjp_ptcl.log 2>/dev/null | tail -1)\n"
             f"  # Get output size\n"
             f"  OSIZE=$(du -sb '{output_prefix}'* 2>/dev/null | awk '{{s+=$1}} END {{printf \"%d\", s}}')\n"
             f"  if [ -n \"$PCT\" ]; then\n"
@@ -2007,7 +2016,7 @@ class ModPipeline(DecryptionPipeline):
             f"wait $PID\n"
             f"exit $?\n"
         )
-        monitor_path = "/tmp/jjp_convert_monitor.sh"
+        monitor_path = "/var/tmp/jjp_convert_monitor.sh"
         monitor_b64 = base64.b64encode(monitor_script.encode()).decode()
         self.executor.run(
             f"echo '{monitor_b64}' | base64 -d > {monitor_path} && "
@@ -2043,7 +2052,7 @@ class ModPipeline(DecryptionPipeline):
             log_content = ""
             try:
                 log_content = self.executor.run(
-                    "tail -5 /tmp/jjp_ptcl.log 2>/dev/null", timeout=5).strip()
+                    "tail -5 /var/tmp/jjp_ptcl.log 2>/dev/null", timeout=5).strip()
             except CommandError:
                 pass
             raise PipelineError("Convert",
@@ -2141,7 +2150,7 @@ class ModPipeline(DecryptionPipeline):
             f"  {map_str} \\\n"
             f"  -end 2>&1\n"
         )
-        script_path = "/tmp/jjp_build_iso.sh"
+        script_path = "/var/tmp/jjp_build_iso.sh"
         script_b64 = base64.b64encode(script.encode()).decode()
         self.executor.run(
             f"echo '{script_b64}' | base64 -d > {script_path} && "
@@ -2268,9 +2277,11 @@ class ModPipeline(DecryptionPipeline):
             except CommandError:
                 self.log(f"Warning: Could not remove {self._chunks_dir}", "info")
 
-        # Clean up partclone log
+        # Clean up partclone log and temp scripts
         try:
-            self.executor.run("rm -f /tmp/jjp_ptcl.log 2>/dev/null; true", timeout=5)
+            self.executor.run(
+                "rm -f /var/tmp/jjp_ptcl.log /var/tmp/jjp_convert_monitor.sh "
+                "/var/tmp/jjp_build_iso.sh 2>/dev/null; true", timeout=5)
         except CommandError:
             pass
 
@@ -2889,11 +2900,20 @@ class StandaloneModPipeline(ModPipeline):
 
         self._ensure_iso_tools()
 
+        # Re-mount if the previous mount was cleaned up by systemd-tmpfiles-clean
+        if self._iso_mount:
+            try:
+                self.executor.run(
+                    f"mountpoint -q '{self._iso_mount}'", timeout=5)
+            except CommandError:
+                self.log("ISO mount disappeared, re-mounting...", "info")
+                self._iso_mount = None
+
         if not self._iso_mount:
             wsl_iso = self.executor.to_exec_path(self.image_path)
             import uuid as _uuid
             tag = _uuid.uuid4().hex[:8]
-            self._iso_mount = f"/tmp/jjp_iso_{tag}"
+            self._iso_mount = f"/var/tmp/jjp_iso_{tag}"
             try:
                 self.executor.run(f"mkdir -p {self._iso_mount}", timeout=10)
                 self.executor.run(
@@ -2932,7 +2952,7 @@ class StandaloneModPipeline(ModPipeline):
 
         import uuid as _uuid
         tag = _uuid.uuid4().hex[:8]
-        self._chunks_dir = f"/tmp/jjp_chunks_{tag}"
+        self._chunks_dir = f"/var/tmp/jjp_chunks_{tag}"
         output_prefix = (f"{self._chunks_dir}/"
                          f"{config.GAME_PARTITION}.ext4-ptcl-img.gz.")
         self.executor.run(f"mkdir -p '{self._chunks_dir}'", timeout=10)
@@ -2943,7 +2963,7 @@ class StandaloneModPipeline(ModPipeline):
         convert_cmd = (
             f"set -o pipefail && "
             f"partclone.ext4 -c -s '{wsl_img}' -o - "
-            f"2> >(stdbuf -oL tr '\\r' '\\n' > /tmp/jjp_ptcl.log) "
+            f"2> >(stdbuf -oL tr '\\r' '\\n' > /var/tmp/jjp_ptcl.log) "
             f"| {compressor} "
             f"| split -b {split_size} -a 2 - '{output_prefix}'"
         )
@@ -2955,7 +2975,7 @@ class StandaloneModPipeline(ModPipeline):
             f"while kill -0 $PID 2>/dev/null; do\n"
             f"  sleep 3\n"
             f"  PCT=$(grep -oP 'Completed:\\s*\\K[\\d.]+' "
-            f"/tmp/jjp_ptcl.log 2>/dev/null | tail -1)\n"
+            f"/var/tmp/jjp_ptcl.log 2>/dev/null | tail -1)\n"
             f"  OSIZE=$(du -sb '{output_prefix}'* 2>/dev/null "
             f"| awk '{{s+=$1}} END {{printf \"%d\", s}}')\n"
             f"  if [ -n \"$PCT\" ]; then\n"
@@ -2972,7 +2992,7 @@ class StandaloneModPipeline(ModPipeline):
             f"exit $?\n"
         )
         import base64
-        monitor_path = "/tmp/jjp_convert_monitor.sh"
+        monitor_path = "/var/tmp/jjp_convert_monitor.sh"
         monitor_b64 = base64.b64encode(monitor_script.encode()).decode()
         self.executor.run(
             f"echo '{monitor_b64}' | base64 -d > {monitor_path} && "
@@ -3008,7 +3028,7 @@ class StandaloneModPipeline(ModPipeline):
             log_content = ""
             try:
                 log_content = self.executor.run(
-                    "tail -5 /tmp/jjp_ptcl.log 2>/dev/null",
+                    "tail -5 /var/tmp/jjp_ptcl.log 2>/dev/null",
                     timeout=5).strip()
             except CommandError:
                 pass
@@ -3065,7 +3085,8 @@ class StandaloneModPipeline(ModPipeline):
 
         try:
             self.executor.run(
-                "rm -f /tmp/jjp_ptcl.log 2>/dev/null; true", timeout=5)
+                "rm -f /var/tmp/jjp_ptcl.log /var/tmp/jjp_convert_monitor.sh "
+                "/var/tmp/jjp_build_iso.sh 2>/dev/null; true", timeout=5)
         except CommandError:
             pass
 
