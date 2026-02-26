@@ -222,12 +222,17 @@ class DecryptionPipeline:
     # --- Phase 0: Extract (ISO → raw ext4) ---
 
     def _raw_img_cache_path(self):
-        """Deterministic cache path for the extracted raw image, based on ISO filename."""
+        """Deterministic cache path for the extracted raw image, based on ISO filename.
+
+        Uses /var/tmp instead of /tmp because WSL2's systemd-tmpfiles-clean
+        can delete large files from /tmp while they are still loop-mounted,
+        causing e2fsck / partclone to fail with 'No such file or directory'.
+        """
         import os
         basename = os.path.splitext(os.path.basename(self.image_path))[0]
         # Sanitize for use as a Linux filename
         safe = re.sub(r'[^a-zA-Z0-9._-]', '_', basename)
-        return f"/tmp/jjp_raw_{safe}.img"
+        return f"/var/tmp/jjp_raw_{safe}.img"
 
     def _phase_extract(self):
         if not self._is_iso():
@@ -1303,8 +1308,9 @@ class DecryptionPipeline:
             except CommandError:
                 pass
 
-        # Clean up any leftover raw image in /tmp (it was moved to output folder)
-        if self._raw_img_path and self._raw_img_path.startswith("/tmp/"):
+        # Clean up any leftover raw image in temp dirs (it was moved to output folder)
+        if self._raw_img_path and (self._raw_img_path.startswith("/tmp/") or
+                                   self._raw_img_path.startswith("/var/tmp/")):
             try:
                 self.executor.run(f"rm -f '{self._raw_img_path}' 2>/dev/null; true", timeout=10)
             except CommandError:
@@ -1873,6 +1879,18 @@ class ModPipeline(DecryptionPipeline):
             self.mount_point = None
 
         wsl_img = self._raw_img_path
+
+        # Flush and verify the raw image survived (WSL2 tmpfiles can delete it)
+        try:
+            self.executor.run("sync", timeout=15)
+            self.executor.run(f"test -f '{wsl_img}'", timeout=5)
+        except CommandError:
+            raise PipelineError("Convert",
+                f"Raw image disappeared: {wsl_img}\n"
+                "This can happen when WSL2's systemd-tmpfiles-clean deletes "
+                "large files from /tmp during long operations.\n"
+                "Please try running the mod pipeline again.")
+
         self.log("Running e2fsck to repair filesystem metadata...", "info")
         try:
             for line in self.executor.stream(
@@ -2508,7 +2526,8 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
             except CommandError:
                 pass
 
-        if self._raw_img_path and self._raw_img_path.startswith("/tmp/"):
+        if self._raw_img_path and (self._raw_img_path.startswith("/tmp/") or
+                                   self._raw_img_path.startswith("/var/tmp/")):
             try:
                 self.executor.run(
                     f"rm -f '{self._raw_img_path}' 2>/dev/null; true",
@@ -2845,6 +2864,18 @@ class StandaloneModPipeline(ModPipeline):
             self.mount_point = None
 
         wsl_img = self._raw_img_path
+
+        # Flush and verify the raw image survived (WSL2 tmpfiles can delete it)
+        try:
+            self.executor.run("sync", timeout=15)
+            self.executor.run(f"test -f '{wsl_img}'", timeout=5)
+        except CommandError:
+            raise PipelineError("Convert",
+                f"Raw image disappeared: {wsl_img}\n"
+                "This can happen when WSL2's systemd-tmpfiles-clean deletes "
+                "large files from /tmp during long operations.\n"
+                "Please try running the mod pipeline again.")
+
         self.log("Running e2fsck...", "info")
         try:
             for line in self.executor.stream(
