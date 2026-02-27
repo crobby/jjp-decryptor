@@ -285,7 +285,7 @@ Alternatively, decrypt to a folder on C: and copy the files afterward.
 
 ### Mount fails with "No such file or directory" (WSL1)
 If you see mount errors even though the file exists, your WSL distribution may be running WSL version 1 instead of 2. WSL1 does not support loop-mounting. Fix:
-1. Run `wsl --update` in a Windows terminal
+1. Run `wsl --update` in a Windows terminal (must be done first — step 2 won't work without it)
 2. Run `wsl --set-version Ubuntu 2` (replace `Ubuntu` with your distro name)
 3. Restart the app
 
