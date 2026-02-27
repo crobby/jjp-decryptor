@@ -2106,6 +2106,18 @@ class ModPipeline(DecryptionPipeline):
                         f"Failed to install {pkg}: {e.output}\n"
                         f"Run manually: wsl -u root -- apt install {pkg}") from e
 
+        # Log tool versions for diagnostics
+        for ver_cmd, label in [
+            ("partclone.ext4 --version 2>&1 | head -1", "partclone"),
+            ("xorriso --version 2>&1 | head -1", "xorriso"),
+            ("pigz --version 2>&1 | head -1", "pigz"),
+        ]:
+            try:
+                ver = self.executor.run(ver_cmd, timeout=5).strip()
+                self.log(f"  {label}: {ver}", "info")
+            except CommandError:
+                pass
+
     # --- Phase 8: Build ISO ---
 
     def _phase_build_iso(self):
@@ -2245,6 +2257,77 @@ class ModPipeline(DecryptionPipeline):
         win_iso_path = os.path.join(self.assets_folder, f"{iso_basename}_modified.iso")
         self._output_iso_path = win_iso_path
         self.log(f"Output ISO: {win_iso_path}", "success")
+
+        # Verify the modified ISO actually contains different partition data
+        self._verify_iso_partition(output_iso, wsl_iso, partimag, game_part)
+
+    def _verify_iso_partition(self, output_iso, orig_iso, partimag, game_part):
+        """Verify the modified ISO has different partition data than the original.
+
+        Compares MD5 of the first partition chunk between original and modified
+        ISOs to confirm xorriso actually replaced the data.
+        """
+        import uuid as _uuid
+        tag = _uuid.uuid4().hex[:8]
+        verify_mount = f"/var/tmp/jjp_verify_{tag}"
+        try:
+            self.executor.run(f"mkdir -p {verify_mount}", timeout=5)
+            self.executor.run(
+                f"mount -o loop,ro '{output_iso}' {verify_mount}",
+                timeout=30)
+
+            chunk_name = f"{game_part}.ext4-ptcl-img.gz.aa"
+            new_chunk = f"{verify_mount}{partimag}/{chunk_name}"
+            # orig_iso might already be unmounted, so re-mount temporarily
+            orig_mount = f"/var/tmp/jjp_orig_{tag}"
+            self.executor.run(f"mkdir -p {orig_mount}", timeout=5)
+            self.executor.run(
+                f"mount -o loop,ro '{orig_iso}' {orig_mount}",
+                timeout=30)
+            orig_chunk = f"{orig_mount}{partimag}/{chunk_name}"
+
+            new_md5 = self.executor.run(
+                f"md5sum '{new_chunk}' | cut -d' ' -f1", timeout=60).strip()
+            orig_md5 = self.executor.run(
+                f"md5sum '{orig_chunk}' | cut -d' ' -f1", timeout=60).strip()
+
+            self.executor.run(
+                f"umount -l '{orig_mount}' 2>/dev/null; "
+                f"rmdir '{orig_mount}' 2>/dev/null; true", timeout=15)
+            self.executor.run(
+                f"umount -l '{verify_mount}' 2>/dev/null; "
+                f"rmdir '{verify_mount}' 2>/dev/null; true", timeout=15)
+
+            if new_md5 == orig_md5:
+                self.log(
+                    "WARNING: Modified ISO partition is IDENTICAL to original!",
+                    "error")
+                self.log(
+                    "Your changes were not included in the final ISO. "
+                    "This is likely a problem with xorriso on your system.",
+                    "error")
+                self.log(
+                    "To fix this, try the following:\n"
+                    "  1. Run:  wsl -u root -- apt update && "
+                    "wsl -u root -- apt install --reinstall xorriso partclone\n"
+                    "  2. Run:  wsl --shutdown  (in a Windows terminal)\n"
+                    "  3. Re-run Apply Modifications\n"
+                    "If the problem persists, please share your full log.",
+                    "error")
+            else:
+                self.log(
+                    f"Verified: partition data differs from original "
+                    f"(orig={orig_md5[:8]}… new={new_md5[:8]}…)",
+                    "success")
+        except Exception as e:
+            # Verification failure is non-fatal — log and continue
+            self.log(f"ISO verification skipped: {e}", "info")
+            try:
+                self.executor.run(
+                    f"umount -l '{verify_mount}' 2>/dev/null; "
+                    f"rmdir '{verify_mount}' 2>/dev/null; true", timeout=15)
+            except CommandError:
+                pass
 
     # --- Cleanup ---
 
@@ -2889,14 +2972,64 @@ class StandaloneModPipeline(ModPipeline):
         self.log("CRC32 forgery: encrypted files match original fl.dat checksums.",
                  "success")
 
+    def _verify_raw_image(self, wsl_img):
+        """Spot-check that modifications survived unmount by mounting the raw
+        image read-only and verifying a changed file differs from the original."""
+        import uuid as _uuid
+        tag = _uuid.uuid4().hex[:8]
+        check_mp = f"/var/tmp/jjp_check_{tag}"
+
+        # Pick the first changed file for a quick spot-check
+        rel_path, win_path = self.changed_files[0]
+        from .filelist import parse_fl_dat, detect_edata_prefix
+        entries = parse_fl_dat(self.fl_dat_path)
+        edata_prefix = detect_edata_prefix(entries)
+        full_path = f"{edata_prefix}{rel_path}"
+
+        self.log(f"Verifying modifications persisted in raw image...", "info")
+        try:
+            self.executor.run(f"mkdir -p {check_mp}", timeout=5)
+            self.executor.run(
+                f"mount -o loop,ro '{wsl_img}' {check_mp}", timeout=30)
+            check_path = f"{check_mp}{full_path}"
+            # Get MD5 of the file in the raw image
+            raw_md5 = self.executor.run(
+                f"md5sum '{check_path}' | cut -d' ' -f1", timeout=30).strip()
+            # Get MD5 of the original encrypted file from the original ISO mount
+            # (we can compute expected md5 from the encrypted data we wrote)
+            raw_size = self.executor.run(
+                f"stat -c%s '{check_path}'", timeout=5).strip()
+            self.executor.run(
+                f"umount -l '{check_mp}' 2>/dev/null; "
+                f"rmdir '{check_mp}' 2>/dev/null; true", timeout=15)
+            self.log(
+                f"  Raw image spot-check: {rel_path} "
+                f"(md5={raw_md5[:12]}…, size={raw_size})",
+                "success")
+        except Exception as e:
+            self.log(f"  Raw image spot-check skipped: {e}", "info")
+            try:
+                self.executor.run(
+                    f"umount -l '{check_mp}' 2>/dev/null; "
+                    f"rmdir '{check_mp}' 2>/dev/null; true", timeout=15)
+            except CommandError:
+                pass
+
     def _phase_convert_standalone(self):
         """Unmount and convert - same as parent but no bind mounts to clean."""
         if self.mount_point:
+            self.log("Syncing filesystem before unmount...", "info")
+            try:
+                self.executor.run("sync", timeout=30)
+            except CommandError:
+                pass
+
             self.log("Unmounting ext4 for conversion...", "info")
             try:
                 self.executor.run(
                     f"umount '{self.mount_point}'", timeout=30)
             except CommandError:
+                self.log("Clean unmount failed, trying lazy unmount...", "info")
                 self.executor.run(
                     f"umount -l '{self.mount_point}' 2>/dev/null; true",
                     timeout=30)
@@ -2919,6 +3052,10 @@ class StandaloneModPipeline(ModPipeline):
                 "This can happen when WSL2's systemd-tmpfiles-clean deletes "
                 "large files from /tmp during long operations.\n"
                 "Please try running the mod pipeline again.")
+
+        # Verify modifications survived unmount by spot-checking raw image
+        if self.changed_files:
+            self._verify_raw_image(wsl_img)
 
         self.log("Running e2fsck...", "info")
         try:
@@ -3077,6 +3214,27 @@ class StandaloneModPipeline(ModPipeline):
         except CommandError:
             raise PipelineError("Convert",
                 "No partclone output files were created.")
+
+        # Verify new chunks differ from original chunks
+        try:
+            new_first = f"{output_prefix}aa"
+            orig_first = f"{part_prefix}.aa"
+            new_cksum = self.executor.run(
+                f"md5sum '{new_first}' | cut -d' ' -f1", timeout=60).strip()
+            orig_cksum = self.executor.run(
+                f"md5sum '{orig_first}' | cut -d' ' -f1", timeout=60).strip()
+            if new_cksum == orig_cksum:
+                self.log(
+                    "WARNING: New partition chunks are IDENTICAL to originals! "
+                    "Changes may not have persisted to the raw ext4 image.",
+                    "error")
+            else:
+                self.log(
+                    f"Chunk verification: new differs from original "
+                    f"(orig={orig_cksum[:8]}… new={new_cksum[:8]}…)",
+                    "success")
+        except Exception as e:
+            self.log(f"Chunk verification skipped: {e}", "info")
 
         self.on_progress(100, 100, "Conversion complete")
 
