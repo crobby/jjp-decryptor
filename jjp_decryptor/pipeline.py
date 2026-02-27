@@ -2253,13 +2253,14 @@ class ModPipeline(DecryptionPipeline):
         except (CommandError, ValueError):
             raise PipelineError("Build ISO", "ISO file was not created.")
 
-        self.on_progress(100, 100, "ISO build complete")
         win_iso_path = os.path.join(self.assets_folder, f"{iso_basename}_modified.iso")
         self._output_iso_path = win_iso_path
         self.log(f"Output ISO: {win_iso_path}", "success")
 
         # Verify the modified ISO actually contains different partition data
+        self.on_progress(100, 100, "Verifying ISO...")
         self._verify_iso_partition(output_iso, wsl_iso, partimag, game_part)
+        self.on_progress(100, 100, "ISO build complete")
 
     def _verify_iso_partition(self, output_iso, orig_iso, partimag, game_part):
         """Verify the modified ISO has different partition data than the original.
@@ -3055,6 +3056,7 @@ class StandaloneModPipeline(ModPipeline):
 
         # Verify modifications survived unmount by spot-checking raw image
         if self.changed_files:
+            self.on_progress(0, 100, "Verifying raw image...")
             self._verify_raw_image(wsl_img)
 
         self.log("Running e2fsck...", "info")
@@ -3216,6 +3218,7 @@ class StandaloneModPipeline(ModPipeline):
                 "No partclone output files were created.")
 
         # Verify new chunks differ from original chunks
+        self.on_progress(100, 100, "Verifying chunks...")
         try:
             new_first = f"{output_prefix}aa"
             orig_first = f"{part_prefix}.aa"
