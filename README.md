@@ -32,8 +32,7 @@ No USB dongle, gcc, or usbipd-win required. No additional Python packages needed
 ### Windows
 - **Windows 10/11** with WSL2 enabled
 - **WSL2** with Ubuntu (or similar): `wsl --install`
-- **partclone** in WSL: `wsl -u root -- apt install partclone`
-- **xorriso** in WSL: `wsl -u root -- apt install xorriso`
+- **partclone** and **xorriso** in WSL — the app has an **Install Missing** button that installs these automatically, or install manually: `wsl -u root -- apt install partclone xorriso`
 - **Rufus** (for writing modified ISOs to USB): [rufus.ie](https://rufus.ie/)
 
 ### macOS
@@ -112,10 +111,10 @@ docker run --privileged --rm \
 ### Decrypting Assets
 
 1. Launch the app
-2. Prerequisites are checked automatically on startup (Docker on macOS, WSL2 on Windows, native tools on Linux)
+2. Prerequisites are checked automatically on startup — if anything is missing, click **Install Missing** to fix it
 3. Click **Browse** to select your game image (ISO or ext4)
 4. Click **Browse** to select an output folder for decrypted assets
-5. Click **Start Decryption**
+5. Click **Start Decryption** — if the output folder already has files, the app will warn you before overwriting
 
 The first run for a game will scan the filesystem and auto-detect filler sizes for every encrypted file. This generates an `fl_decrypted.dat` in the output folder which makes subsequent runs faster. The app remembers your last-used paths between sessions.
 
@@ -276,6 +275,19 @@ If the machine shows errors for ALL files after flashing:
 - **Windows**: Ensure the ISO was written with Rufus in **ISO mode** (not DD mode)
 - **macOS/Linux**: Ensure the ISO was written with balenaEtcher or `dd` (not a drag-and-drop file copy)
 - Check that the compression flags match the original (`pigz --fast -b 1024 --rsyncable`)
+
+### Output folder is empty after decryption (USB/external drive)
+WSL2 only sees Windows drives that were connected when WSL started. If you plugged in a USB or external drive after booting, WSL silently writes to its own virtual filesystem instead of the real drive — the pipeline appears to succeed but nothing ends up on the drive. Fix:
+1. Run `wsl --shutdown` in a Windows terminal
+2. Retry (WSL restarts and detects the drive)
+
+Alternatively, decrypt to a folder on C: and copy the files afterward.
+
+### Mount fails with "No such file or directory" (WSL1)
+If you see mount errors even though the file exists, your WSL distribution may be running WSL version 1 instead of 2. WSL1 does not support loop-mounting. Fix:
+1. Run `wsl --update` in a Windows terminal
+2. Run `wsl --set-version Ubuntu 2` (replace `Ubuntu` with your distro name)
+3. Restart the app
 
 ### Stale mounts from a previous crash
 The app detects and cleans up stale mounts automatically on startup. If you have issues, you can manually clean up:
