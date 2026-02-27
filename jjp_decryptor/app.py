@@ -89,6 +89,7 @@ class App:
             on_clear_cache=self._clear_cache,
             on_theme_change=self._on_theme_change,
             initial_theme=saved_theme,
+            on_install_prereqs=self._install_prereqs,
         )
 
         # Detect game name when file is selected (register before loading settings
@@ -255,6 +256,87 @@ class App:
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _install_prereqs(self):
+        """Install missing prerequisites in a background thread."""
+        from .executor import WslExecutor, DockerExecutor, NativeExecutor
+
+        if isinstance(self.executor, WslExecutor):
+            self._install_prereqs_wsl()
+        elif isinstance(self.executor, DockerExecutor):
+            self.window.append_log(
+                "Docker prerequisites are managed automatically. "
+                "Please ensure Docker Desktop is running.", "info")
+        elif isinstance(self.executor, NativeExecutor):
+            self._install_prereqs_native()
+
+    def _install_prereqs_wsl(self):
+        """Install partclone + xorriso inside WSL and prompt for restart."""
+        self.window.append_log("Installing prerequisites in WSL...", "info")
+        self.window.install_btn.configure(state=tk.DISABLED)
+
+        def _run():
+            try:
+                for line in self.executor.stream(
+                    "apt-get update -qq && "
+                    "apt-get install -y partclone xorriso 2>&1",
+                    timeout=300,
+                ):
+                    self.msg_queue.put(LogMsg(f"  {line}", "info"))
+                self.msg_queue.put(LogMsg(
+                    "Prerequisites installed successfully.", "success"))
+            except Exception as e:
+                self.msg_queue.put(LogMsg(
+                    f"Installation failed: {e}", "error"))
+
+            # Re-check and update indicators
+            results = check_prerequisites(self.executor, standalone=True)
+            for name, passed, message in results:
+                self.root.after(0, self.window.set_prereq, name, passed, message)
+
+            all_ok = all(p for _, p, _ in results)
+            if all_ok:
+                self.msg_queue.put(LogMsg("All prerequisites met.", "success"))
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Installation Complete",
+                    "All prerequisites installed successfully.\n\n"
+                    "If this is your first time installing WSL, "
+                    "please restart your computer for best results."))
+            else:
+                self.msg_queue.put(LogMsg(
+                    "Some prerequisites are still missing.", "error"))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _install_prereqs_native(self):
+        """Install partclone + xorriso on native Linux."""
+        self.window.append_log("Installing prerequisites...", "info")
+        self.window.install_btn.configure(state=tk.DISABLED)
+
+        def _run():
+            try:
+                for line in self.executor.stream(
+                    "apt-get update -qq && "
+                    "apt-get install -y partclone xorriso 2>&1",
+                    timeout=300,
+                ):
+                    self.msg_queue.put(LogMsg(f"  {line}", "info"))
+                self.msg_queue.put(LogMsg(
+                    "Prerequisites installed successfully.", "success"))
+            except Exception as e:
+                self.msg_queue.put(LogMsg(
+                    f"Installation failed: {e}", "error"))
+
+            # Re-check and update indicators
+            results = check_prerequisites(self.executor, standalone=True)
+            for name, passed, message in results:
+                self.root.after(0, self.window.set_prereq, name, passed, message)
+
+            all_ok = all(p for _, p, _ in results)
+            if all_ok:
+                self.msg_queue.put(LogMsg("All prerequisites met.", "success"))
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _check_for_update(self):
         """Check GitHub for a newer release in a background thread."""
         def _run():
@@ -292,6 +374,17 @@ class App:
             messagebox.showwarning("Missing Input",
                 "Please select an output folder.")
             return
+
+        # Warn if output folder already has decrypted content
+        if os.path.isdir(output_path) and os.listdir(output_path):
+            proceed = messagebox.askyesno(
+                "Output Folder Not Empty",
+                "The output folder already contains files.\n\n"
+                "Decrypting again will overwrite any existing files "
+                "(including files you may have modified).\n\n"
+                "Continue?")
+            if not proceed:
+                return
 
         self._save_settings()
 

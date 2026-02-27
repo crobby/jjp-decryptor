@@ -100,7 +100,8 @@ class MainWindow:
 
     def __init__(self, root, on_check_prereqs, on_start, on_cancel,
                  on_mod_apply=None, on_mod_cancel=None, on_clear_cache=None,
-                 on_theme_change=None, initial_theme=None):
+                 on_theme_change=None, initial_theme=None,
+                 on_install_prereqs=None):
         self.root = root
         self._on_check_prereqs = on_check_prereqs
         self._on_start = on_start
@@ -109,6 +110,7 @@ class MainWindow:
         self._on_mod_cancel = on_mod_cancel
         self._on_clear_cache = on_clear_cache
         self._on_theme_change = on_theme_change
+        self._on_install_prereqs = on_install_prereqs
 
         # Title is set by App (includes version); fallback here for standalone use
         if not root.title():
@@ -386,6 +388,10 @@ class MainWindow:
         self.check_btn = ttk.Button(btn_row, text="Check Prerequisites",
                                      command=self._on_check_prereqs)
         self.check_btn.pack(side=tk.LEFT, padx=4)
+        self.install_btn = ttk.Button(btn_row, text="Install Missing",
+                                       command=self._on_install_prereqs,
+                                       state=tk.DISABLED)
+        self.install_btn.pack(side=tk.LEFT, padx=4)
 
     def _build_decrypt_tab(self, parent):
         # Step indicator (rebuilt dynamically for standalone vs normal mode)
@@ -546,6 +552,11 @@ class MainWindow:
                 label.configure(text="[OK]", foreground=c["success"])
             else:
                 label.configure(text="[  X ]", foreground=c["error"])
+        # Enable "Install Missing" if any prereq failed and handler exists
+        if self._on_install_prereqs and self._prereq_state:
+            has_failures = any(not v for v in self._prereq_state.values())
+            self.install_btn.configure(
+                state=tk.NORMAL if has_failures else tk.DISABLED)
 
     def _build_step_labels(self, parent, phases, label_list):
         """Build step indicator labels into a frame."""
