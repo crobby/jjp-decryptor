@@ -232,26 +232,37 @@ class DecryptionPipeline:
             except Exception:
                 pass
 
-            # WSL tool versions
-            tools = [
-                ("xorriso", "xorriso --version 2>&1 | head -1"),
-                ("partclone", "partclone.restore --version 2>&1 | head -1"),
-                ("pigz", "pigz --version 2>&1 | head -1"),
-                ("e2fsck", "e2fsck -V 2>&1 | head -1"),
-                ("base64", "base64 --version 2>&1 | head -1"),
-                ("gzip", "gzip --version 2>&1 | head -1"),
-            ]
-            for name, cmd in tools:
-                try:
-                    out = self.executor.run(cmd, timeout=5).strip()
-                    if out:
-                        lines.append(f"  {name}: {out}")
-                    else:
-                        lines.append(f"  {name}: (installed, no version)")
-                except Exception:
-                    lines.append(f"  {name}: NOT FOUND")
+        # Docker info (macOS only)
+        if sys.platform == "darwin":
+            try:
+                rc, out, _ = self.executor.run_host(
+                    "docker --version", timeout=5)
+                if rc == 0 and out.strip():
+                    lines.append(f"  Docker: {out.strip()}")
+            except Exception:
+                lines.append("  Docker: (could not detect)")
 
-        # Disk space on /tmp (where WSL work happens)
+        # Tool versions inside executor (WSL, Docker, or native)
+        tools = [
+            ("xorriso", "xorriso --version 2>&1 | head -1"),
+            ("partclone", "partclone.restore --version 2>&1 | head -1"),
+            ("pigz", "pigz --version 2>&1 | head -1"),
+            ("e2fsck", "e2fsck -V 2>&1 | head -1"),
+            ("base64", "base64 --version 2>&1 | head -1"),
+            ("gzip", "gzip --version 2>&1 | head -1"),
+            ("ffmpeg", "ffmpeg -version 2>&1 | head -1"),
+        ]
+        for name, cmd in tools:
+            try:
+                out = self.executor.run(cmd, timeout=5).strip()
+                if out:
+                    lines.append(f"  {name}: {out}")
+                else:
+                    lines.append(f"  {name}: (installed, no version)")
+            except Exception:
+                lines.append(f"  {name}: NOT FOUND")
+
+        # Disk space on /tmp (where executor work happens)
         try:
             out = self.executor.run(
                 "df -h /tmp 2>/dev/null | tail -1",
@@ -2961,6 +2972,187 @@ class StandaloneModPipeline(ModPipeline):
         except CommandError:
             pass
 
+    # ------------------------------------------------------------------
+    # Audio format helpers
+    # ------------------------------------------------------------------
+
+    def _maybe_convert_audio(self, content, entry, mp, rel_path):
+        """Check if a WAV replacement needs format conversion and do it.
+
+        Reads the original encrypted file from the mounted image, decrypts
+        it, compares WAV format against the replacement, and converts if
+        they differ.  Returns (possibly converted) content bytes.
+        """
+        import os
+        import base64 as _b64
+        from .audio import (detect_wav_format, wav_formats_match,
+                            format_description, format_diff,
+                            needs_ffmpeg, convert_wav_python,
+                            is_compressed_wav)
+        from .crypto import decrypt_file as _df
+
+        repl_fmt = detect_wav_format(content)
+        if repl_fmt is None:
+            if is_compressed_wav(content):
+                self.log(f"  {rel_path}: compressed WAV — "
+                         "attempting ffmpeg conversion", "info")
+                # Need ffmpeg to decode compressed WAV; read original for target
+                orig_fmt = self._get_original_wav_format(entry, mp)
+                if orig_fmt:
+                    converted = self._convert_wav_ffmpeg(
+                        content, orig_fmt, rel_path)
+                    if converted is not None:
+                        return converted
+                self.log(f"  Warning: could not convert compressed WAV",
+                         "error")
+            return content  # not a WAV we can parse; pass through
+
+        # Read and decrypt the original to get its format
+        orig_fmt = self._get_original_wav_format(entry, mp)
+        if orig_fmt is None:
+            return content  # can't read original; pass through
+
+        if wav_formats_match(repl_fmt, orig_fmt):
+            self.log(f"  Audio format OK: {format_description(repl_fmt)}",
+                     "info")
+            return content
+
+        diff = format_diff(repl_fmt, orig_fmt)
+        self.log(f"  Audio format mismatch: {diff}", "info")
+
+        # Try pure Python first (handles bit-depth + channel changes)
+        if not needs_ffmpeg(repl_fmt, orig_fmt):
+            converted = convert_wav_python(content, repl_fmt, orig_fmt)
+            if converted is not None:
+                self.log(f"  Converted (Python): "
+                         f"{format_description(repl_fmt)} -> "
+                         f"{format_description(orig_fmt)}", "success")
+                return converted
+
+        # Need ffmpeg for sample rate conversion
+        converted = self._convert_wav_ffmpeg(content, orig_fmt, rel_path)
+        if converted is not None:
+            self.log(f"  Converted (ffmpeg): "
+                     f"{format_description(repl_fmt)} -> "
+                     f"{format_description(orig_fmt)}", "success")
+            return converted
+
+        self.log(f"  Warning: could not convert {rel_path} ({diff}). "
+                 "Game may reject this file.", "error")
+        return content
+
+    def _get_original_wav_format(self, entry, mp):
+        """Read the original encrypted file from the image, decrypt it,
+        and return its WAV format dict (or None)."""
+        import base64 as _b64
+        from .audio import detect_wav_format
+        from .crypto import decrypt_file as _df
+
+        orig_path = f"{mp}{entry.path}"
+        try:
+            enc_b64 = self.executor.run(
+                f"base64 '{orig_path}'", timeout=120).strip()
+            orig_enc = _b64.b64decode(enc_b64)
+            orig_dec = _df(orig_enc, entry.filler_size, entry.path)
+            return detect_wav_format(orig_dec)
+        except Exception:
+            return None
+
+    def _ensure_ffmpeg(self):
+        """Install ffmpeg in the executor if not already present."""
+        if getattr(self, '_ffmpeg_checked', False):
+            return self._ffmpeg_available
+        self._ffmpeg_checked = True
+        try:
+            self.executor.run("which ffmpeg", timeout=10)
+            self._ffmpeg_available = True
+            return True
+        except CommandError:
+            pass
+
+        self.log("Installing ffmpeg for audio conversion...", "info")
+        try:
+            from .executor import DockerExecutor
+            if isinstance(self.executor, DockerExecutor):
+                self.executor.run(
+                    "apk add --no-cache ffmpeg 2>&1", timeout=120)
+            else:
+                self.executor.run(
+                    "DEBIAN_FRONTEND=noninteractive "
+                    "apt-get install -y ffmpeg 2>&1", timeout=120)
+            self._ffmpeg_available = True
+            self.log("ffmpeg installed.", "success")
+            return True
+        except CommandError as e:
+            self._ffmpeg_available = False
+            self.log(f"Warning: could not install ffmpeg: {e.output}",
+                     "error")
+            return False
+
+    def _convert_wav_ffmpeg(self, src_bytes, tgt_fmt, rel_path):
+        """Convert audio bytes to target WAV format using ffmpeg.
+
+        Returns converted WAV bytes, or None on failure.
+        """
+        import os
+        import tempfile
+        import base64 as _b64
+        from .audio import detect_wav_format
+
+        if not self._ensure_ffmpeg():
+            self.log("  ffmpeg not available — cannot resample", "error")
+            return None
+
+        tmp_dir = os.environ.get('TEMP', os.environ.get('TMP', '.'))
+        src_tmp = None
+        out_tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix='.wav', dir=tmp_dir, delete=False
+            ) as tf:
+                tf.write(src_bytes)
+                src_tmp = tf.name
+            out_tmp = src_tmp + '.converted.wav'
+
+            src_exec = self.executor.to_exec_path(src_tmp)
+            out_exec = self.executor.to_exec_path(out_tmp)
+
+            codec = f"pcm_s{tgt_fmt['sampwidth'] * 8}le"
+            cmd = (
+                f"ffmpeg -y -i '{src_exec}' "
+                f"-ar {tgt_fmt['framerate']} "
+                f"-ac {tgt_fmt['nchannels']} "
+                f"-c:a {codec} "
+                f"'{out_exec}' 2>&1"
+            )
+            self.executor.run(cmd, timeout=120)
+
+            # Read the result back
+            from .executor import DockerExecutor
+            if isinstance(self.executor, DockerExecutor):
+                enc = self.executor.run(
+                    f"base64 '{out_exec}'", timeout=120).strip()
+                return _b64.b64decode(enc)
+            else:
+                # WSL — the output file is accessible from Windows
+                if os.path.isfile(out_tmp) and os.path.getsize(out_tmp) > 44:
+                    with open(out_tmp, 'rb') as f:
+                        return f.read()
+                # Fallback: read via executor
+                enc = self.executor.run(
+                    f"base64 '{out_exec}'", timeout=120).strip()
+                return _b64.b64decode(enc)
+        except Exception as e:
+            self.log(f"  ffmpeg conversion failed: {e}", "error")
+            return None
+        finally:
+            for p in (src_tmp, out_tmp):
+                if p:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+
     def _phase_encrypt_standalone(self):
         """Re-encrypt changed files using pure Python crypto."""
         import os
@@ -2997,6 +3189,11 @@ class StandaloneModPipeline(ModPipeline):
             # Read replacement content
             with open(win_path, 'rb') as f:
                 content = f.read()
+
+            # Auto-convert audio files if format doesn't match the original
+            if rel_path.lower().endswith(".wav"):
+                content = self._maybe_convert_audio(
+                    content, entry, mp, rel_path)
 
             self.log(f"Processing: {full_path}", "info")
             self.log(f"  filler={entry.filler_size} "

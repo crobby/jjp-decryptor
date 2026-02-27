@@ -10,4 +10,5 @@ RUN apk add --no-cache \
     coreutils \
     rsync \
     util-linux \
-    findmnt
+    findmnt \
+    ffmpeg

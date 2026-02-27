@@ -141,9 +141,35 @@ Detailed instructions: [Windows (PDF)](https://marketing.jerseyjackpinball.com/g
 ### File Format Notes
 
 - Images: **PNG** (same dimensions as originals)
-- Videos: **WebM** (same codec/resolution as originals)
-- Audio: **WAV** or **OGG** (matching the original format)
-- Format or dimension mismatches won't corrupt the image but may crash or glitch the game at runtime
+- Videos: **WebM** with VP9 codec (must match original resolution — see below)
+- Audio: **WAV** or **OGG** — WAV files are **auto-converted** if they don't match the original's format
+
+#### Audio Auto-Conversion
+
+JJP games validate WAV audio parameters strictly — a format mismatch (wrong sample rate, bit depth, or channel count) causes the game to reject the file at boot. Different games, and even different files within the same game, use different specs (e.g. Hobbit has mono/44.1kHz, stereo/44.1kHz, and stereo/48kHz files).
+
+The mod pipeline automatically detects format mismatches and converts replacement WAV files to match the original:
+
+- **Bit depth** (8/16/24/32-bit) and **channel count** (mono/stereo) changes are handled in pure Python — no extra tools needed
+- **Sample rate** changes (e.g. 48kHz → 44.1kHz) use ffmpeg, which is installed on-demand in WSL/Docker if needed
+- **OGG** files pass through as-is — the game's audio engine (Allegro 5.2) decodes OGG natively at any sample rate
+- **Compressed WAV** files (non-PCM codecs like ADPCM or MP3-in-WAV) are converted via ffmpeg
+
+The conversion is logged so you can see exactly what was changed:
+```
+Audio format mismatch: 2ch->1ch, 48000Hz->44100Hz
+Converted (ffmpeg): 2ch/16bit/48000Hz -> 1ch/16bit/44100Hz
+```
+
+#### Video Format
+
+All JJP games use **WebM container with VP9 codec** for video. Unlike audio, the game does not strictly validate video parameters — it decodes video through FFmpeg's libavformat/libavcodec, which handles format variations gracefully. However, replacement videos should:
+
+- Use **WebM** container with **VP9** codec
+- Match the **original resolution** — each video asset is sized for a specific screen region, so a different resolution will display at the wrong size
+- Preserve the **alpha channel** for overlay videos (files named `*.a.webm`) which use transparency
+
+Video files are not auto-converted because resolution changes are creative decisions, and re-encoding video is computationally expensive.
 
 ## Architecture
 
@@ -154,6 +180,7 @@ jjp_decryptor/
 ├── app.py           # Application controller — wires GUI ↔ pipeline via thread-safe queue
 ├── gui.py           # Tkinter GUI with dark/light theme, tabs, progress tracking
 ├── pipeline.py      # StandaloneDecryptPipeline and StandaloneModPipeline
+├── audio.py         # WAV format detection and pure Python audio conversion
 ├── crypto.py        # Pure Python PRNG, XOR cipher, filler detection, CRC32 forgery
 ├── filelist.py      # fl.dat parser/generator and filesystem scanner
 ├── resources.py     # Embedded C sources (legacy dongle-based hooks, kept for reference)
