@@ -168,6 +168,106 @@ class DecryptionPipeline:
         if self.cancelled:
             raise PipelineError("Cancelled", "Operation cancelled by user.")
 
+    def _log_system_diagnostics(self):
+        """Log system/environment info for remote diagnostics."""
+        from . import __version__
+
+        def _clean_utf16(text):
+            """Strip UTF-16 null bytes that WSL commands sometimes produce."""
+            return text.replace("\x00", "")
+
+        lines = [f"jjp-decryptor v{__version__}"]
+
+        # Python version
+        lines.append(f"Python {sys.version.split()[0]}")
+
+        # Host OS
+        if sys.platform == "win32":
+            try:
+                rc, out, _ = self.executor.run_host(
+                    "powershell -NoProfile -Command "
+                    '"(Get-CimInstance Win32_OperatingSystem).Caption '
+                    "+ ' (build ' + "
+                    "[System.Environment]::OSVersion.Version.Build + ')'\"",
+                    timeout=10)
+                out = _clean_utf16(out)
+                if rc == 0 and out.strip():
+                    lines.append(f"Windows: {out.strip()}")
+            except Exception:
+                lines.append("Windows: (could not detect version)")
+        elif sys.platform == "darwin":
+            try:
+                rc, out, _ = self.executor.run_host(
+                    "sw_vers -productVersion", timeout=5)
+                if rc == 0 and out.strip():
+                    lines.append(f"macOS: {out.strip()}")
+            except Exception:
+                pass
+
+        # WSL info (Windows only)
+        if sys.platform == "win32":
+            # WSL version + kernel
+            try:
+                rc, out, _ = self.executor.run_host(
+                    "wsl --version", timeout=10)
+                out = _clean_utf16(out)
+                if rc == 0 and out.strip():
+                    for wl in out.strip().splitlines()[:3]:
+                        wl = wl.strip()
+                        if wl:
+                            lines.append(f"  {wl}")
+            except Exception:
+                lines.append("  WSL: (could not detect)")
+
+            # WSL distro
+            try:
+                rc, out, _ = self.executor.run_host(
+                    "wsl -l -v", timeout=10)
+                out = _clean_utf16(out)
+                if rc == 0 and out.strip():
+                    for dl in out.strip().splitlines():
+                        dl = dl.strip()
+                        if dl and "NAME" not in dl.upper()[:10]:
+                            lines.append(f"  {dl}")
+            except Exception:
+                pass
+
+            # WSL tool versions
+            tools = [
+                ("xorriso", "xorriso --version 2>&1 | head -1"),
+                ("partclone", "partclone.restore --version 2>&1 | head -1"),
+                ("pigz", "pigz --version 2>&1 | head -1"),
+                ("e2fsck", "e2fsck -V 2>&1 | head -1"),
+                ("base64", "base64 --version 2>&1 | head -1"),
+                ("gzip", "gzip --version 2>&1 | head -1"),
+            ]
+            for name, cmd in tools:
+                try:
+                    out = self.executor.run(cmd, timeout=5).strip()
+                    if out:
+                        lines.append(f"  {name}: {out}")
+                    else:
+                        lines.append(f"  {name}: (installed, no version)")
+                except Exception:
+                    lines.append(f"  {name}: NOT FOUND")
+
+        # Disk space on /tmp (where WSL work happens)
+        try:
+            out = self.executor.run(
+                "df -h /tmp 2>/dev/null | tail -1",
+                timeout=5).strip()
+            if out:
+                parts = out.split()
+                free = parts[3] if len(parts) >= 4 else out
+                lines.append(f"  /tmp free space: {free}")
+        except Exception:
+            pass
+
+        self.log("--- System Diagnostics ---", "info")
+        for line in lines:
+            self.log(line, "info")
+        self.log("--------------------------", "info")
+
     def _is_iso(self):
         """Check if the input file is an ISO image."""
         return self.image_path.lower().endswith(".iso")
@@ -2258,7 +2358,7 @@ class ModPipeline(DecryptionPipeline):
         self.log(f"Output ISO: {win_iso_path}", "success")
 
         # Verify the modified ISO actually contains different partition data
-        self.on_progress(100, 100, "Verifying ISO...")
+        self.on_progress(0, 0, "Verifying ISO...")
         self._verify_iso_partition(output_iso, wsl_iso, partimag, game_part)
         self.on_progress(100, 100, "ISO build complete")
 
@@ -2414,6 +2514,8 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
         from .executor import DockerExecutor
         cleanup_phase = len(config.STANDALONE_PHASES) - 1
         try:
+            self._log_system_diagnostics()
+
             # Verify both paths are accessible from the executor
             for label, path in [("Game image", self.image_path),
                                 ("Output folder", self.output_path)]:
@@ -2687,6 +2789,8 @@ class StandaloneModPipeline(ModPipeline):
         from .executor import DockerExecutor
         cleanup_phase = len(config.STANDALONE_MOD_PHASES) - 1
         try:
+            self._log_system_diagnostics()
+
             # Verify both paths are accessible from the executor
             for label, path in [("Game image", self.image_path),
                                 ("Assets folder", self.assets_folder)]:
@@ -2929,6 +3033,7 @@ class StandaloneModPipeline(ModPipeline):
 
             # Write encrypted file to game image
             import base64 as _b64
+            import hashlib as _hl
             enc_b64 = _b64.b64encode(encrypted).decode()
             dest_path = f"{mp}{entry.path}"
             dest_dir = dest_path.rsplit('/', 1)[0]
@@ -2955,6 +3060,14 @@ class StandaloneModPipeline(ModPipeline):
                         timeout=30)
                 self.log(f"[VERIFY OK] {rel_path}", "success")
                 ok += 1
+                # Save expected MD5 + size for the first file so the
+                # post-unmount spot-check can do a real comparison.
+                if not hasattr(self, '_expected_spot'):
+                    self._expected_spot = {
+                        'md5': _hl.md5(encrypted).hexdigest(),
+                        'size': len(encrypted),
+                        'content_md5': _hl.md5(content).hexdigest(),
+                    }
             except (CommandError, OSError) as e:
                 self.log(f"[FAIL] {rel_path} (write failed: {e})", "error")
                 fail += 1
@@ -2975,7 +3088,7 @@ class StandaloneModPipeline(ModPipeline):
 
     def _verify_raw_image(self, wsl_img):
         """Spot-check that modifications survived unmount by mounting the raw
-        image read-only and verifying a changed file differs from the original."""
+        image read-only and comparing against expected encrypted bytes."""
         import uuid as _uuid
         tag = _uuid.uuid4().hex[:8]
         check_mp = f"/var/tmp/jjp_check_{tag}"
@@ -2985,28 +3098,90 @@ class StandaloneModPipeline(ModPipeline):
         from .filelist import parse_fl_dat, detect_edata_prefix
         entries = parse_fl_dat(self.fl_dat_path)
         edata_prefix = detect_edata_prefix(entries)
+        entry_map = {e.path: e for e in entries}
         full_path = f"{edata_prefix}{rel_path}"
+        entry = entry_map.get(full_path)
 
-        self.log(f"Verifying modifications persisted in raw image...", "info")
+        expected = getattr(self, '_expected_spot', None)
+
+        self.log("Verifying modifications persisted in raw image...", "info")
         try:
             self.executor.run(f"mkdir -p {check_mp}", timeout=5)
             self.executor.run(
                 f"mount -o loop,ro '{wsl_img}' {check_mp}", timeout=30)
             check_path = f"{check_mp}{full_path}"
-            # Get MD5 of the file in the raw image
+
+            # Get MD5 and size of the encrypted file on disk
             raw_md5 = self.executor.run(
                 f"md5sum '{check_path}' | cut -d' ' -f1", timeout=30).strip()
-            # Get MD5 of the original encrypted file from the original ISO mount
-            # (we can compute expected md5 from the encrypted data we wrote)
-            raw_size = self.executor.run(
-                f"stat -c%s '{check_path}'", timeout=5).strip()
+            raw_size = int(self.executor.run(
+                f"stat -c%s '{check_path}'", timeout=5).strip())
+
+            # Compare against what the encrypt phase wrote
+            if expected:
+                md5_match = raw_md5 == expected['md5']
+                size_match = raw_size == expected['size']
+                if md5_match and size_match:
+                    self.log(
+                        f"  Encrypted bytes match expected "
+                        f"(md5={raw_md5[:12]}…, size={raw_size})",
+                        "success")
+                else:
+                    self.log(
+                        f"  WARNING: Encrypted bytes do NOT match!",
+                        "error")
+                    self.log(
+                        f"    Expected: md5={expected['md5'][:12]}… "
+                        f"size={expected['size']}",
+                        "error")
+                    self.log(
+                        f"    On disk:  md5={raw_md5[:12]}… size={raw_size}",
+                        "error")
+
+            # Read the encrypted file back, decrypt it, and compare content
+            # against the replacement file to prove the round-trip works.
+            if entry:
+                import base64 as _b64
+                enc_b64 = self.executor.run(
+                    f"base64 '{check_path}'", timeout=120).strip()
+                disk_encrypted = _b64.b64decode(enc_b64)
+                from .crypto import decrypt_file as _df
+                import hashlib as _hl
+                disk_decrypted = _df(
+                    disk_encrypted, entry.filler_size, entry.path)
+                # Strip the 4-byte CRC forgery suffix to get original content
+                disk_content = disk_decrypted[:-4] if len(disk_decrypted) > 4 else disk_decrypted
+                disk_content_md5 = _hl.md5(disk_content).hexdigest()
+
+                # Compare against the replacement file
+                with open(win_path, 'rb') as fh:
+                    replacement_md5 = _hl.md5(fh.read()).hexdigest()
+
+                if disk_content_md5 == replacement_md5:
+                    self.log(
+                        f"  Content round-trip verified: {rel_path} "
+                        f"(md5={disk_content_md5[:12]}…)",
+                        "success")
+                else:
+                    self.log(
+                        f"  WARNING: Decrypted content does NOT match "
+                        f"replacement file!",
+                        "error")
+                    self.log(
+                        f"    Replacement: md5={replacement_md5[:12]}…",
+                        "error")
+                    self.log(
+                        f"    On disk:     md5={disk_content_md5[:12]}…",
+                        "error")
+                    if expected and disk_content_md5 != expected.get('content_md5'):
+                        self.log(
+                            f"    Expected:    md5="
+                            f"{expected['content_md5'][:12]}…",
+                            "error")
+
             self.executor.run(
                 f"umount -l '{check_mp}' 2>/dev/null; "
                 f"rmdir '{check_mp}' 2>/dev/null; true", timeout=15)
-            self.log(
-                f"  Raw image spot-check: {rel_path} "
-                f"(md5={raw_md5[:12]}…, size={raw_size})",
-                "success")
         except Exception as e:
             self.log(f"  Raw image spot-check skipped: {e}", "info")
             try:

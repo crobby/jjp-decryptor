@@ -276,6 +276,20 @@ If the machine shows errors for ALL files after flashing:
 - **macOS/Linux**: Ensure the ISO was written with balenaEtcher or `dd` (not a drag-and-drop file copy)
 - Check that the compression flags match the original (`pigz --fast -b 1024 --rsyncable`)
 
+### Rufus warnings when writing the ISO (Windows)
+Rufus may show two warnings when writing a JJP ISO to USB. Both are expected:
+
+1. **"Revoked UEFI bootloader detected"** — The JJP Clonezilla ISOs ship with an older GRUB/shim that has been added to the UEFI revocation list. Click **OK** — JJP pinball machines do not use UEFI Secure Boot, so this is harmless.
+2. **"Download required" (GRUB version mismatch)** — Rufus detects the ISO uses an older GRUB (e.g. 2.12) and offers to download a matching `core.img`. Click **Yes** to let Rufus download it. Using a mismatched GRUB version can cause the machine to ignore the USB entirely.
+
+### Machine ignores the USB update
+If the machine recognizes the USB stick but does not boot from it:
+- **Use ISO mode in Rufus** (not DD mode) when prompted
+- **Click Yes on the GRUB download prompt** (see above) — a mismatched GRUB version is the most common cause
+- **Try a USB 2.0 stick, 8 GB or smaller** — some JJP hardware cannot boot from USB 3.0 or large-capacity drives
+- **Try a different USB port** on the machine
+- **Power the machine off completely** (not standby), insert the USB, then power on
+
 ### Output folder is empty after decryption (USB/external drive)
 WSL2 only sees Windows drives that were connected when WSL started. If you plugged in a USB or external drive after booting, WSL silently writes to its own virtual filesystem instead of the real drive — the pipeline appears to succeed but nothing ends up on the drive. Fix:
 1. Run `wsl --shutdown` in a Windows terminal
