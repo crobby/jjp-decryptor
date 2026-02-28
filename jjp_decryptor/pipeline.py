@@ -3779,19 +3779,38 @@ class StandaloneModPipeline(ModPipeline):
                         timeout=30)
                 except CommandError:
                     pass
-                # Do NOT detach the loop device here.  On WSL2,
-                # losetup -d after a lazy unmount can discard dirty
-                # pages for the backing file, destroying it.  Let the
-                # kernel clean up the loop device naturally.
+
+                # Try sync — if it times out, WSL2's I/O is stalled.
+                wsl_hung = False
                 try:
                     self.executor.run("sync", timeout=120)
                 except CommandError:
-                    pass
-                # Give the kernel time to settle after lazy unmount
-                try:
-                    self.executor.run("sleep 5", timeout=10)
-                except CommandError:
-                    pass
+                    wsl_hung = True
+
+                if wsl_hung:
+                    # WSL2's I/O subsystem is completely stalled after
+                    # lazy unmount on a large loop-mounted image.
+                    # Terminating WSL2 forces a clean VM shutdown, which
+                    # flushes all pending I/O to the VHD.  On restart,
+                    # the raw image file will be intact.
+                    self.log("WSL2 I/O stalled after unmount. "
+                             "Restarting WSL2 to flush pending writes...",
+                             "warning")
+                    import subprocess as _sp
+                    try:
+                        _sp.run(["wsl", "--shutdown"],
+                                timeout=60, capture_output=True)
+                    except Exception:
+                        pass
+                    import time as _time
+                    _time.sleep(5)
+                    self.log("WSL2 restarted.", "info")
+                else:
+                    # Give the kernel time to settle after lazy unmount
+                    try:
+                        self.executor.run("sleep 5", timeout=10)
+                    except CommandError:
+                        pass
 
             try:
                 self.executor.run(
@@ -3802,15 +3821,11 @@ class StandaloneModPipeline(ModPipeline):
 
         wsl_img = self._raw_img_path
 
-        # Flush and verify the raw image survived
-        try:
-            self.executor.run("sync", timeout=120)
-        except CommandError:
-            pass  # sync timeout is not fatal — check file existence next
+        # Verify the raw image survived unmount
         try:
             stat_out = self.executor.run(
                 f"stat --format='%s bytes, inode %i' '{wsl_img}' 2>&1",
-                timeout=10).strip()
+                timeout=30).strip()
             self.log(f"  Raw image: {stat_out}", "info")
         except CommandError as e:
             try:
