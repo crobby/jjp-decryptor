@@ -18,17 +18,18 @@ def _find_project_file(filename):
 
     Works for both source installs and macOS PyInstaller .app bundles,
     where __file__ is inside Contents/Frameworks/ but --add-data files
-    land in Contents/Resources/.
+    land in Contents/Resources/.  Uses realpath() to resolve symlinks
+    so Docker bind-mounts see the real file, not a dangling symlink.
     """
-    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    pkg_dir = os.path.dirname(os.path.realpath(__file__))
     # Source install: file is one level above the package
     candidate = os.path.join(os.path.dirname(pkg_dir), filename)
     if os.path.isfile(candidate):
-        return candidate
+        return os.path.realpath(candidate)
     # macOS .app bundle: check Contents/Resources/
     resources = os.path.join(pkg_dir, "..", "Resources", filename)
     if os.path.isfile(resources):
-        return os.path.abspath(resources)
+        return os.path.realpath(resources)
     return candidate  # fall back to original (will fail with clear error)
 
 
@@ -38,14 +39,15 @@ def _project_dirs():
     For source installs this is just the directory containing jjp_decryptor/.
     For macOS .app bundles, both Contents/Frameworks/ (Python code) and
     Contents/Resources/ (--add-data files like partclone_to_raw.py) are needed.
+    Uses realpath() so Docker bind-mounts use resolved paths.
     """
-    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    pkg_dir = os.path.dirname(os.path.realpath(__file__))
     parent = os.path.dirname(pkg_dir)
     dirs = [parent]
     # macOS .app bundle: Resources/ is a sibling of Frameworks/
     resources = os.path.join(pkg_dir, "..", "Resources")
     if os.path.isdir(resources):
-        resources = os.path.abspath(resources)
+        resources = os.path.realpath(resources)
         if resources != parent:
             dirs.append(resources)
     return dirs
