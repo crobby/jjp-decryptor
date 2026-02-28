@@ -32,7 +32,7 @@ No USB dongle, gcc, or usbipd-win required. No additional Python packages needed
 ### Windows
 - **Windows 10/11** with WSL2 enabled
 - **WSL2** with Ubuntu (or similar): `wsl --install`
-- **partclone** and **xorriso** in WSL — the app has an **Install Missing** button that installs these automatically, or install manually: `wsl -u root -- apt install partclone xorriso`
+- **partclone**, **xorriso**, and **e2fsprogs** (provides `debugfs`) in WSL — the app has an **Install Missing** button that installs these automatically, or install manually: `wsl -u root -- apt install partclone xorriso e2fsprogs`
 - **Rufus** (for writing modified ISOs to USB): [rufus.ie](https://rufus.ie/)
 
 ### macOS
@@ -43,8 +43,9 @@ No USB dongle, gcc, or usbipd-win required. No additional Python packages needed
 ### Linux
 - **partclone**: `sudo apt install partclone`
 - **xorriso**: `sudo apt install xorriso`
+- **e2fsprogs** (provides `debugfs`): `sudo apt install e2fsprogs`
 - **pigz**: `sudo apt install pigz`
-- Requires `sudo` for loop-mounting ext4 images
+- Requires `sudo` for the decrypt pipeline (loop-mounting ext4 images for read-only access)
 - **dd** or **balenaEtcher** for writing modified ISOs to USB
 
 ## Installation
@@ -56,7 +57,7 @@ Download from the [Releases page](https://github.com/davidvanderburgh/jjp-decryp
 - **Windows**: `JJP_Asset_Decryptor_Setup.exe` — includes bundled Python runtime
 - **macOS**: `JJP_Asset_Decryptor.dmg` — drag to Applications (see macOS note below)
 
-**Windows installer note**: When prompted, check **Install prerequisites** to set up WSL2, partclone, and xorriso. If WSL2 was just enabled, reboot and re-run the prerequisites installer from the Start Menu.
+**Windows installer note**: When prompted, check **Install prerequisites** to set up WSL2, partclone, xorriso, and debugfs. If WSL2 was just enabled, reboot and re-run the prerequisites installer from the Start Menu.
 
 **macOS note**: On first launch, macOS will block the app because it is not notarized with Apple. This is a one-time setup:
 
@@ -274,7 +275,7 @@ flowchart TD
 flowchart TD
     A[Start] --> B[Scan]
     B --> C[Extract]
-    C --> D[Mount]
+    C --> D[Prepare]
     D --> E[Encrypt]
     E --> F[Convert]
     F --> G[Build ISO]
@@ -283,8 +284,9 @@ flowchart TD
 
     B -.- B1["Compare output folder against .checksums.md5\nto find modified files"]
     C -.- C1["Fresh extraction from original ISO"]
-    E -.- E1["For each changed file:\n1. Auto-convert audio format if needed\n2. Pad with filler + CRC32-forged suffix\n3. XOR-encrypt with same keystream\n4. Forge filler bytes for encrypted CRC match\n5. Verify both CRC32s\n6. Restore original fl.dat unmodified"]
-    F -.- F1["Unmount → e2fsck → partclone.ext4 -c\npigz --fast -b 1024 --rsyncable\nSplit into 1GB chunks"]
+    D -.- D1["Validate ext4 image + detect game via debugfs"]
+    E -.- E1["For each changed file:\n1. Auto-convert audio format if needed\n2. Pad with filler + CRC32-forged suffix\n3. XOR-encrypt with same keystream\n4. Forge filler bytes for encrypted CRC match\n5. Verify both CRC32s\n6. Write into image via debugfs\n7. Restore original fl.dat unmodified"]
+    F -.- F1["Verify via debugfs dump → e2fsck\npartclone.ext4 -c\npigz --fast -b 1024 --rsyncable\nSplit into 1GB chunks"]
     G -.- G1["xorriso splices new partition chunks\ninto original ISO preserving boot records"]
 ```
 
@@ -292,11 +294,11 @@ flowchart TD
 |-------|-------------|
 | **Scan** | Compares output folder against `.checksums.md5` baseline to identify modified files |
 | **Extract** | Extracts a **fresh** ext4 image from the original ISO (never reuses previous images) |
-| **Mount** | Loop-mounts the fresh ext4 image read-write |
-| **Encrypt** | For each changed file: reads replacement content, auto-converts audio if format mismatches original (WAV/OGG), encrypts with pure Python crypto, forges both CRC32 checksums, writes encrypted file back into the ext4 image. Restores original `fl.dat` unmodified |
-| **Convert** | Syncs and unmounts ext4 (with retry and verification that writes persisted), runs `e2fsck -fy`, converts to partclone format with `pigz --fast -b 1024 --rsyncable`, splits into ~1GB chunks matching the original layout |
+| **Prepare** | Validates the ext4 image and detects the game name using `debugfs` (no mount needed) |
+| **Encrypt** | For each changed file: reads replacement content, auto-converts audio if format mismatches original (WAV/OGG), encrypts with pure Python crypto, forges both CRC32 checksums, writes encrypted file directly into the ext4 image via `debugfs`. Restores original `fl.dat` unmodified |
+| **Convert** | Verifies modifications via `debugfs dump`, runs `e2fsck -fy`, converts to partclone format with `pigz --fast -b 1024 --rsyncable`, splits into ~1GB chunks matching the original layout |
 | **Build ISO** | Uses `xorriso` to splice the new partition chunks into the original ISO, preserving all boot records (MBR, El Torito, EFI, Syslinux) |
-| **Cleanup** | Unmounts everything, removes temp files and raw images |
+| **Cleanup** | Removes temp files and staging directory |
 
 ## Troubleshooting
 
@@ -338,14 +340,6 @@ The app detects and cleans up stale mounts automatically on startup. If you have
 ```
 wsl -u root -- bash -c "findmnt -rn -o TARGET | grep /mnt/jjp_ | sort -r | xargs -r umount -lf; rmdir /mnt/jjp_* 2>/dev/null"
 ```
-
-### "Modified files did not persist" error (Windows)
-If the mod pipeline aborts with this error, it means WSL2 did not flush writes to the disk image before unmounting. The tool detects this and stops before building a broken ISO.
-
-**v2.5.6+** fixes this by remounting the filesystem read-only before unmounting, which forces the ext4 journal to commit all writes. If you still see this error:
-1. Run `wsl --shutdown` in a Windows terminal, then retry
-2. Close other programs using WSL (terminals, VS Code Remote, etc.)
-3. If you use Norton, Avast, or similar antivirus, try temporarily disabling real-time protection — some AV products interfere with WSL2 disk I/O
 
 ### Mount fails with "bad superblock"
 This can happen if partclone.restore produces a truncated image. The tool automatically detects and fixes this by reading the ext4 superblock and extending the image to full filesystem size. If it still fails, delete cached images and retry:

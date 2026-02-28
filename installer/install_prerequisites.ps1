@@ -8,6 +8,7 @@
     - Ubuntu distribution in WSL
     - partclone (partition imaging in WSL)
     - xorriso (ISO manipulation in WSL)
+    - debugfs / e2fsprogs (ext4 image tools in WSL)
 
     This script is safe to re-run — it checks before installing and skips
     anything that is already present.
@@ -188,6 +189,39 @@ if ($wslAvailable -and $ubuntuFound) {
 }
 
 # ============================================================
+# 5. debugfs (e2fsprogs) in WSL
+# ============================================================
+Write-Step "Checking debugfs in WSL..."
+
+if ($wslAvailable -and $ubuntuFound) {
+    $dfFound = $false
+    try {
+        wsl -u root -- which debugfs 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $dfFound = $true
+            Write-OK "debugfs"
+        }
+    } catch {}
+
+    if (-not $dfFound) {
+        Write-Host "  Installing e2fsprogs (provides debugfs)..." -ForegroundColor Cyan
+        wsl -u root -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq e2fsprogs" 2>&1 | ForEach-Object { Write-Host "    $_" }
+        try {
+            wsl -u root -- which debugfs 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Installed "debugfs"
+            } else {
+                Write-FAIL "debugfs"
+            }
+        } catch {
+            Write-FAIL "debugfs"
+        }
+    }
+} else {
+    Write-SKIP "debugfs (WSL/Ubuntu not available yet)"
+}
+
+# ============================================================
 # Summary
 # ============================================================
 Write-Host "`n"
@@ -217,7 +251,7 @@ if ($needsReboot) {
     Write-Host "  After rebooting, run this script again" -ForegroundColor Yellow
     Write-Host "  from the Start Menu to install the" -ForegroundColor Yellow
     Write-Host "  remaining WSL prerequisites (partclone," -ForegroundColor Yellow
-    Write-Host "  xorriso)." -ForegroundColor Yellow
+    Write-Host "  xorriso, debugfs)." -ForegroundColor Yellow
     Write-Host "============================================" -ForegroundColor Yellow
     Write-Host ""
     $reboot = Read-Host "  Reboot now? (y/n)"

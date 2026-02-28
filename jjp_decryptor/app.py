@@ -278,7 +278,7 @@ class App:
             try:
                 for line in self.executor.stream(
                     "apt-get update -qq && "
-                    "apt-get install -y partclone xorriso 2>&1",
+                    "apt-get install -y partclone xorriso e2fsprogs 2>&1",
                     timeout=300,
                 ):
                     self.msg_queue.put(LogMsg(f"  {line}", "info"))
@@ -316,7 +316,7 @@ class App:
             try:
                 for line in self.executor.stream(
                     "apt-get update -qq && "
-                    "apt-get install -y partclone xorriso 2>&1",
+                    "apt-get install -y partclone xorriso e2fsprogs 2>&1",
                     timeout=300,
                 ):
                     self.msg_queue.put(LogMsg(f"  {line}", "info"))
