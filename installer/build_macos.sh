@@ -38,6 +38,8 @@ pyinstaller \
     --paths "$ROOT_DIR" \
     --add-data "$ROOT_DIR/jjp_decryptor/icon.png:jjp_decryptor" \
     --add-data "$ROOT_DIR/jjp_decryptor/Dockerfile:jjp_decryptor" \
+    --add-data "$ROOT_DIR/jjp_decryptor/crypto.py:jjp_decryptor" \
+    --add-data "$ROOT_DIR/jjp_decryptor/filelist.py:jjp_decryptor" \
     --add-data "$ROOT_DIR/partclone_to_raw.py:." \
     --noconfirm \
     --clean \

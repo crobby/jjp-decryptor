@@ -2660,17 +2660,15 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
         from .executor import DockerExecutor
         if isinstance(self.executor, DockerExecutor):
             # Docker on macOS: write module source into cache dir (mounted
-            # as /tmp).  We read via inspect so it works even when PyInstaller
-            # bundles only .pyc files or uses symlinks we can't resolve.
-            import inspect
+            # as /tmp).  Read via pkgutil.get_data which works with both
+            # source installs and PyInstaller bundles (--add-data files).
+            import pkgutil
             cache_dir = self.executor._cache_dir()
-            for mod_name in ("crypto", "filelist"):
-                mod = __import__(
-                    f"jjp_decryptor.{mod_name}", fromlist=[mod_name])
-                source = inspect.getsource(mod)
-                dst = os.path.join(cache_dir, f"jjp_{mod_name}.py")
-                with open(dst, "w", encoding="utf-8") as f:
-                    f.write(source)
+            for module in ("crypto.py", "filelist.py"):
+                data = pkgutil.get_data("jjp_decryptor", module)
+                dst = os.path.join(cache_dir, f"jjp_{module}")
+                with open(dst, "wb") as f:
+                    f.write(data)
         else:
             pkg_dir = os.path.dirname(os.path.abspath(__file__))
             for module in ("crypto.py", "filelist.py"):
