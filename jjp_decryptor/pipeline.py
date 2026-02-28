@@ -2050,7 +2050,10 @@ class ModPipeline(DecryptionPipeline):
 
         # Flush and verify the raw image survived (WSL2 tmpfiles can delete it)
         try:
-            self.executor.run("sync", timeout=15)
+            self.executor.run("sync", timeout=120)
+        except CommandError:
+            pass  # sync timeout is not fatal — check file existence next
+        try:
             self.executor.run(f"test -f '{wsl_img}'", timeout=5)
         except CommandError:
             raise PipelineError("Convert",
@@ -3753,7 +3756,10 @@ class StandaloneModPipeline(ModPipeline):
 
         # Flush and verify the raw image survived (WSL2 tmpfiles can delete it)
         try:
-            self.executor.run("sync", timeout=15)
+            self.executor.run("sync", timeout=120)
+        except CommandError:
+            pass  # sync timeout is not fatal — check file existence next
+        try:
             self.executor.run(f"test -f '{wsl_img}'", timeout=5)
         except CommandError:
             raise PipelineError("Convert",
