@@ -3404,8 +3404,14 @@ class StandaloneModPipeline(ModPipeline):
             enc_b64 = _b64.b64encode(encrypted).decode()
             dest_path = f"{mp}{entry.path}"
             dest_dir = dest_path.rsplit('/', 1)[0]
+            expected_size = len(encrypted)
             try:
                 self.executor.run(f"mkdir -p '{dest_dir}'", timeout=10)
+                # Remove the old file first to avoid stale data when
+                # the new file is shorter than the original (WSL2 loop
+                # mounts can leave trailing bytes if we only redirect).
+                self.executor.run(
+                    f"rm -f '{dest_path}'", timeout=10)
                 if len(enc_b64) > 100000:
                     import tempfile
                     with tempfile.NamedTemporaryFile(
@@ -3425,6 +3431,20 @@ class StandaloneModPipeline(ModPipeline):
                     self.executor.run(
                         f"echo '{enc_b64}' | base64 -d > '{dest_path}'",
                         timeout=30)
+                # Force data to disk immediately so unmount doesn't lose it
+                self.executor.run(
+                    f"sync -d '{dest_path}' 2>/dev/null; true",
+                    timeout=15)
+                # Verify size right away to catch truncation issues early
+                actual_size = int(self.executor.run(
+                    f"stat -c%s '{dest_path}'", timeout=5).strip())
+                if actual_size != expected_size:
+                    self.log(
+                        f"[FAIL] {rel_path} (size mismatch after write: "
+                        f"expected {expected_size}, got {actual_size})",
+                        "error")
+                    fail += 1
+                    continue
                 self.log(f"[VERIFY OK] {rel_path}", "success")
                 ok += 1
                 # Save expected MD5 + size for the first file so the
@@ -3598,35 +3618,76 @@ class StandaloneModPipeline(ModPipeline):
                     timeout=10)
             except CommandError:
                 pass
+            try:
+                # 4. flush the loop device's block layer buffers
+                loop_dev = self.executor.run(
+                    f"losetup -j '{wsl_img}' 2>/dev/null | head -1 | cut -d: -f1",
+                    timeout=10).strip()
+                if loop_dev:
+                    self.executor.run(
+                        f"blockdev --flushbufs '{loop_dev}' 2>/dev/null; true",
+                        timeout=10)
+            except CommandError:
+                pass
 
             # ---- Unmount with retry ----
             self.log("Unmounting ext4 for conversion...", "info")
             unmounted = False
-            for attempt in range(3):
+            for attempt in range(5):
                 try:
                     self.executor.run(
                         f"umount '{mp}'", timeout=30)
                     unmounted = True
                     break
                 except CommandError:
-                    if attempt < 2:
+                    if attempt < 4:
                         self.log(f"  Unmount attempt {attempt + 1} failed, "
                                  "waiting for I/O to settle...", "info")
+                        # Log what's blocking the mount on first failure
+                        if attempt == 0:
+                            try:
+                                blockers = self.executor.run(
+                                    f"fuser -vm '{mp}' 2>&1 || true",
+                                    timeout=10).strip()
+                                if blockers:
+                                    self.log(f"  Processes using mount: "
+                                             f"{blockers}", "info")
+                            except CommandError:
+                                pass
                         try:
-                            self.executor.run("sync; sleep 2; sync",
-                                              timeout=15)
+                            self.executor.run(
+                                "sync; sleep 2; sync; "
+                                "echo 3 > /proc/sys/vm/drop_caches "
+                                "2>/dev/null; true",
+                                timeout=20)
                         except CommandError:
                             pass
 
             if not unmounted:
-                self.log("Clean unmount failed after 3 attempts. "
+                self.log("Clean unmount failed after 5 attempts. "
                          "Trying lazy unmount...", "error")
                 try:
                     self.executor.run(
                         f"umount -l '{mp}' 2>/dev/null; true",
                         timeout=30)
-                    # After lazy unmount, wait for I/O to flush
-                    self.executor.run("sync; sleep 3; sync", timeout=30)
+                    # After lazy unmount, wait longer for I/O to flush
+                    # and flush the loop device explicitly
+                    self.executor.run(
+                        "sync; sleep 5; sync; "
+                        "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; "
+                        "true", timeout=30)
+                except CommandError:
+                    pass
+                # Try to detach loop device to force final flush
+                try:
+                    loop_dev = self.executor.run(
+                        f"losetup -j '{wsl_img}' 2>/dev/null | head -1 | "
+                        f"cut -d: -f1", timeout=10).strip()
+                    if loop_dev:
+                        self.executor.run(
+                            f"losetup -d '{loop_dev}' 2>/dev/null; true",
+                            timeout=30)
+                        self.executor.run("sync; sleep 2", timeout=15)
                 except CommandError:
                     pass
 
