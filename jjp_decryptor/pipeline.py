@@ -2048,19 +2048,29 @@ class ModPipeline(DecryptionPipeline):
 
         wsl_img = self._raw_img_path
 
-        # Flush and verify the raw image survived (WSL2 tmpfiles can delete it)
+        # Flush and verify the raw image survived
         try:
             self.executor.run("sync", timeout=120)
         except CommandError:
             pass  # sync timeout is not fatal — check file existence next
         try:
-            self.executor.run(f"test -f '{wsl_img}'", timeout=5)
-        except CommandError:
+            stat_out = self.executor.run(
+                f"stat --format='%s bytes, inode %i' '{wsl_img}' 2>&1",
+                timeout=10).strip()
+            self.log(f"  Raw image: {stat_out}", "info")
+        except CommandError as e:
+            try:
+                loops = self.executor.run(
+                    "losetup -a 2>/dev/null || true", timeout=5).strip()
+                if loops:
+                    self.log(f"  Active loop devices: {loops}", "info")
+            except CommandError:
+                pass
             raise PipelineError("Convert",
-                f"Raw image disappeared: {wsl_img}\n"
-                "This can happen when WSL2's systemd-tmpfiles-clean deletes "
-                "large files from /tmp during long operations.\n"
-                "Please try running the mod pipeline again.")
+                f"Raw image not found after unmount: {wsl_img}\n"
+                f"stat output: {e.output}\n\n"
+                "This may be caused by WSL2 discarding cached data "
+                "during unmount. Please try running the mod pipeline again.")
 
         self.log("Running e2fsck to repair filesystem metadata...", "info")
         try:
@@ -3713,6 +3723,15 @@ class StandaloneModPipeline(ModPipeline):
                     pass
 
             # ---- Unmount with retry ----
+            # First, kill anything holding the mount busy so clean
+            # unmount can succeed.  fuser -k sends SIGKILL to all
+            # processes with open files on the mount point.
+            try:
+                self.executor.run(
+                    f"fuser -km '{mp}' 2>/dev/null; true", timeout=15)
+            except CommandError:
+                pass
+
             self.log("Unmounting ext4 for conversion...", "info")
             unmounted = False
             for attempt in range(5):
@@ -3735,6 +3754,13 @@ class StandaloneModPipeline(ModPipeline):
                                              f"{blockers}", "info")
                             except CommandError:
                                 pass
+                            # Kill again in case new processes appeared
+                            try:
+                                self.executor.run(
+                                    f"fuser -km '{mp}' 2>/dev/null; true",
+                                    timeout=15)
+                            except CommandError:
+                                pass
                         try:
                             self.executor.run(
                                 "sync; sleep 2; sync", timeout=60)
@@ -3753,19 +3779,17 @@ class StandaloneModPipeline(ModPipeline):
                         timeout=30)
                 except CommandError:
                     pass
-                # Detach loop device to force writeback
-                try:
-                    loop_dev = self.executor.run(
-                        f"losetup -j '{wsl_img}' 2>/dev/null | head -1 | "
-                        f"cut -d: -f1", timeout=10).strip()
-                    if loop_dev:
-                        self.executor.run(
-                            f"losetup -d '{loop_dev}' 2>/dev/null; true",
-                            timeout=60)
-                except CommandError:
-                    pass
+                # Do NOT detach the loop device here.  On WSL2,
+                # losetup -d after a lazy unmount can discard dirty
+                # pages for the backing file, destroying it.  Let the
+                # kernel clean up the loop device naturally.
                 try:
                     self.executor.run("sync", timeout=120)
+                except CommandError:
+                    pass
+                # Give the kernel time to settle after lazy unmount
+                try:
+                    self.executor.run("sleep 5", timeout=10)
                 except CommandError:
                     pass
 
@@ -3778,19 +3802,29 @@ class StandaloneModPipeline(ModPipeline):
 
         wsl_img = self._raw_img_path
 
-        # Flush and verify the raw image survived (WSL2 tmpfiles can delete it)
+        # Flush and verify the raw image survived
         try:
             self.executor.run("sync", timeout=120)
         except CommandError:
             pass  # sync timeout is not fatal — check file existence next
         try:
-            self.executor.run(f"test -f '{wsl_img}'", timeout=5)
-        except CommandError:
+            stat_out = self.executor.run(
+                f"stat --format='%s bytes, inode %i' '{wsl_img}' 2>&1",
+                timeout=10).strip()
+            self.log(f"  Raw image: {stat_out}", "info")
+        except CommandError as e:
+            try:
+                loops = self.executor.run(
+                    "losetup -a 2>/dev/null || true", timeout=5).strip()
+                if loops:
+                    self.log(f"  Active loop devices: {loops}", "info")
+            except CommandError:
+                pass
             raise PipelineError("Convert",
-                f"Raw image disappeared: {wsl_img}\n"
-                "This can happen when WSL2's systemd-tmpfiles-clean deletes "
-                "large files from /tmp during long operations.\n"
-                "Please try running the mod pipeline again.")
+                f"Raw image not found after unmount: {wsl_img}\n"
+                f"stat output: {e.output}\n\n"
+                "This may be caused by WSL2 discarding cached data "
+                "during unmount. Please try running the mod pipeline again.")
 
         # Verify modifications survived unmount by spot-checking raw image
         if self.changed_files:
