@@ -340,7 +340,9 @@ wsl -u root -- bash -c "findmnt -rn -o TARGET | grep /mnt/jjp_ | sort -r | xargs
 ```
 
 ### "Modified files did not persist" error (Windows)
-If the mod pipeline aborts with this error, it means WSL2 did not flush writes to the disk image before unmounting. The tool detects this and stops before building a broken ISO. To fix:
+If the mod pipeline aborts with this error, it means WSL2 did not flush writes to the disk image before unmounting. The tool detects this and stops before building a broken ISO.
+
+**v2.5.6+** fixes this by remounting the filesystem read-only before unmounting, which forces the ext4 journal to commit all writes. If you still see this error:
 1. Run `wsl --shutdown` in a Windows terminal, then retry
 2. Close other programs using WSL (terminals, VS Code Remote, etc.)
 3. If you use Norton, Avast, or similar antivirus, try temporarily disabling real-time protection — some AV products interfere with WSL2 disk I/O

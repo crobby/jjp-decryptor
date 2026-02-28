@@ -3597,38 +3597,49 @@ class StandaloneModPipeline(ModPipeline):
             mp = self.mount_point
             wsl_img = self._raw_img_path
 
-            # ---- Aggressive flush sequence ----
-            # WSL2's 9p filesystem can delay writes to the underlying image.
-            # We must ensure all data is on disk BEFORE unmounting.
+            # ---- Flush + remount-ro to commit ext4 journal ----
+            # WSL2 lazy unmount can lose writes if the ext4 journal hasn't
+            # committed.  Remounting read-only forces the journal to flush
+            # all pending data and metadata to the backing loop image,
+            # making the filesystem clean BEFORE we attempt to detach.
             self.log("Syncing filesystem before unmount...", "info")
             try:
-                # 1. sync the specific mount point
                 self.executor.run(f"sync -f '{mp}/'", timeout=60)
             except CommandError:
                 pass
             try:
-                # 2. global sync
                 self.executor.run("sync", timeout=30)
             except CommandError:
                 pass
+
+            # Remount read-only — this commits the journal and ensures
+            # all writes are persisted to the raw image file.
+            remounted_ro = False
             try:
-                # 3. drop caches to force dirty pages to disk
                 self.executor.run(
-                    "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; true",
-                    timeout=10)
+                    f"mount -o remount,ro '{mp}'", timeout=60)
+                remounted_ro = True
+                self.log("  Remounted read-only (journal flushed).", "info")
             except CommandError:
-                pass
-            try:
-                # 4. flush the loop device's block layer buffers
-                loop_dev = self.executor.run(
-                    f"losetup -j '{wsl_img}' 2>/dev/null | head -1 | cut -d: -f1",
-                    timeout=10).strip()
-                if loop_dev:
+                self.log("  Remount-ro failed, falling back to sync.",
+                         "info")
+                try:
                     self.executor.run(
-                        f"blockdev --flushbufs '{loop_dev}' 2>/dev/null; true",
-                        timeout=10)
-            except CommandError:
-                pass
+                        "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; "
+                        "true", timeout=10)
+                except CommandError:
+                    pass
+                try:
+                    loop_dev = self.executor.run(
+                        f"losetup -j '{wsl_img}' 2>/dev/null | "
+                        f"head -1 | cut -d: -f1",
+                        timeout=10).strip()
+                    if loop_dev:
+                        self.executor.run(
+                            f"blockdev --flushbufs '{loop_dev}' "
+                            f"2>/dev/null; true", timeout=10)
+                except CommandError:
+                    pass
 
             # ---- Unmount with retry ----
             self.log("Unmounting ext4 for conversion...", "info")
@@ -3643,7 +3654,6 @@ class StandaloneModPipeline(ModPipeline):
                     if attempt < 4:
                         self.log(f"  Unmount attempt {attempt + 1} failed, "
                                  "waiting for I/O to settle...", "info")
-                        # Log what's blocking the mount on first failure
                         if attempt == 0:
                             try:
                                 blockers = self.executor.run(
@@ -3656,29 +3666,23 @@ class StandaloneModPipeline(ModPipeline):
                                 pass
                         try:
                             self.executor.run(
-                                "sync; sleep 2; sync; "
-                                "echo 3 > /proc/sys/vm/drop_caches "
-                                "2>/dev/null; true",
-                                timeout=20)
+                                "sync; sleep 2; sync", timeout=20)
                         except CommandError:
                             pass
 
             if not unmounted:
+                # With remount-ro already done, lazy unmount is safe —
+                # the data is already committed to the raw image.
                 self.log("Clean unmount failed after 5 attempts. "
-                         "Trying lazy unmount...", "error")
+                         "Trying lazy unmount...",
+                         "info" if remounted_ro else "error")
                 try:
                     self.executor.run(
                         f"umount -l '{mp}' 2>/dev/null; true",
                         timeout=30)
-                    # After lazy unmount, wait longer for I/O to flush
-                    # and flush the loop device explicitly
-                    self.executor.run(
-                        "sync; sleep 5; sync; "
-                        "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; "
-                        "true", timeout=30)
                 except CommandError:
                     pass
-                # Try to detach loop device to force final flush
+                # Detach loop device
                 try:
                     loop_dev = self.executor.run(
                         f"losetup -j '{wsl_img}' 2>/dev/null | head -1 | "
@@ -3687,9 +3691,9 @@ class StandaloneModPipeline(ModPipeline):
                         self.executor.run(
                             f"losetup -d '{loop_dev}' 2>/dev/null; true",
                             timeout=30)
-                        self.executor.run("sync; sleep 2", timeout=15)
                 except CommandError:
                     pass
+                self.executor.run("sync; sleep 2", timeout=15)
 
             try:
                 self.executor.run(
