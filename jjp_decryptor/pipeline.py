@@ -3153,6 +3153,139 @@ class StandaloneModPipeline(ModPipeline):
                     except OSError:
                         pass
 
+    # ------------------------------------------------------------------
+    # OGG format helpers
+    # ------------------------------------------------------------------
+
+    def _maybe_convert_ogg(self, content, entry, mp, rel_path):
+        """Check if an OGG replacement needs format conversion and do it.
+
+        Reads the original encrypted file from the mounted image, decrypts
+        it, compares OGG Vorbis format against the replacement, and converts
+        via ffmpeg if they differ.  Returns (possibly converted) content bytes.
+        """
+        from .audio import (detect_ogg_format, ogg_formats_match,
+                            ogg_format_description, ogg_format_diff)
+
+        # Sanity-check magic bytes
+        if len(content) < 4 or content[:4] != b"OggS":
+            self.log(f"  Warning: {rel_path} does not have OGG magic bytes",
+                     "error")
+            return content
+
+        repl_fmt = detect_ogg_format(content)
+        if repl_fmt is None:
+            self.log(f"  Warning: could not parse OGG Vorbis header in "
+                     f"{rel_path}", "error")
+            return content
+
+        orig_fmt = self._get_original_ogg_format(entry, mp)
+        if orig_fmt is None:
+            self.log(f"  Could not read original OGG format; passing through",
+                     "info")
+            return content
+
+        if ogg_formats_match(repl_fmt, orig_fmt):
+            self.log(f"  OGG format OK: {ogg_format_description(repl_fmt)}",
+                     "info")
+            return content
+
+        diff = ogg_format_diff(repl_fmt, orig_fmt)
+        self.log(f"  OGG format mismatch: {diff}", "info")
+
+        converted = self._convert_ogg_ffmpeg(content, orig_fmt, rel_path)
+        if converted is not None:
+            self.log(f"  Converted (ffmpeg): "
+                     f"{ogg_format_description(repl_fmt)} -> "
+                     f"{ogg_format_description(orig_fmt)}", "success")
+            return converted
+
+        self.log(f"  Warning: could not convert {rel_path} ({diff}). "
+                 "Game may ignore this file.", "error")
+        return content
+
+    def _get_original_ogg_format(self, entry, mp):
+        """Read the original encrypted OGG from the image, decrypt it,
+        and return its Vorbis format dict (or None)."""
+        import base64 as _b64
+        from .audio import detect_ogg_format
+        from .crypto import decrypt_file as _df
+
+        orig_path = f"{mp}{entry.path}"
+        try:
+            enc_b64 = self.executor.run(
+                f"base64 '{orig_path}'", timeout=120).strip()
+            orig_enc = _b64.b64decode(enc_b64)
+            orig_dec = _df(orig_enc, entry.filler_size, entry.path)
+            return detect_ogg_format(orig_dec)
+        except Exception:
+            return None
+
+    def _convert_ogg_ffmpeg(self, src_bytes, tgt_fmt, rel_path):
+        """Convert audio bytes to target OGG Vorbis format using ffmpeg.
+
+        Returns converted OGG bytes, or None on failure.
+        """
+        import os
+        import tempfile
+        import base64 as _b64
+
+        if not self._ensure_ffmpeg():
+            self.log("  ffmpeg not available — cannot convert OGG", "error")
+            return None
+
+        tmp_dir = os.environ.get('TEMP', os.environ.get('TMP', '.'))
+        src_tmp = None
+        out_tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix='.ogg', dir=tmp_dir, delete=False
+            ) as tf:
+                tf.write(src_bytes)
+                src_tmp = tf.name
+            out_tmp = src_tmp + '.converted.ogg'
+
+            src_exec = self.executor.to_exec_path(src_tmp)
+            out_exec = self.executor.to_exec_path(out_tmp)
+
+            # Target the original's nominal bitrate (or default 112k)
+            bitrate = tgt_fmt.get("nominal_bitrate", 112000)
+            if bitrate <= 0:
+                bitrate = 112000
+
+            cmd = (
+                f"ffmpeg -y -i '{src_exec}' "
+                f"-ar {tgt_fmt['sample_rate']} "
+                f"-ac {tgt_fmt['nchannels']} "
+                f"-c:a libvorbis -b:a {bitrate} "
+                f"'{out_exec}' 2>&1"
+            )
+            self.executor.run(cmd, timeout=120)
+
+            # Read the result back
+            from .executor import DockerExecutor
+            if isinstance(self.executor, DockerExecutor):
+                enc = self.executor.run(
+                    f"base64 '{out_exec}'", timeout=120).strip()
+                return _b64.b64decode(enc)
+            else:
+                if os.path.isfile(out_tmp) and os.path.getsize(out_tmp) > 28:
+                    with open(out_tmp, 'rb') as f:
+                        return f.read()
+                enc = self.executor.run(
+                    f"base64 '{out_exec}'", timeout=120).strip()
+                return _b64.b64decode(enc)
+        except Exception as e:
+            self.log(f"  ffmpeg OGG conversion failed: {e}", "error")
+            return None
+        finally:
+            for p in (src_tmp, out_tmp):
+                if p:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+
     def _phase_encrypt_standalone(self):
         """Re-encrypt changed files using pure Python crypto."""
         import os
@@ -3191,8 +3324,12 @@ class StandaloneModPipeline(ModPipeline):
                 content = f.read()
 
             # Auto-convert audio files if format doesn't match the original
-            if rel_path.lower().endswith(".wav"):
+            lower = rel_path.lower()
+            if lower.endswith(".wav"):
                 content = self._maybe_convert_audio(
+                    content, entry, mp, rel_path)
+            elif lower.endswith(".ogg"):
+                content = self._maybe_convert_ogg(
                     content, entry, mp, rel_path)
 
             self.log(f"Processing: {full_path}", "info")

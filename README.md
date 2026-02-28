@@ -142,23 +142,26 @@ Detailed instructions: [Windows (PDF)](https://marketing.jerseyjackpinball.com/g
 
 - Images: **PNG** (same dimensions as originals)
 - Videos: **WebM** with VP9 codec (must match original resolution — see below)
-- Audio: **WAV** or **OGG** — WAV files are **auto-converted** if they don't match the original's format
+- Audio: **WAV** or **OGG** — both are **auto-converted** if they don't match the original's format
 
 #### Audio Auto-Conversion
 
-JJP games validate WAV audio parameters strictly — a format mismatch (wrong sample rate, bit depth, or channel count) causes the game to reject the file at boot. Different games, and even different files within the same game, use different specs (e.g. Hobbit has mono/44.1kHz, stereo/44.1kHz, and stereo/48kHz files).
+JJP games are strict about audio format — a mismatch in sample rate, bit depth, or channel count can cause the game to reject the file or ignore it. Different games, and even different files within the same game, use different specs (e.g. Hobbit has mono/44.1kHz, stereo/44.1kHz, and stereo/48kHz WAV files; song-select previews are stereo/44.1kHz/112kbps OGG Vorbis).
 
-The mod pipeline automatically detects format mismatches and converts replacement WAV files to match the original:
+The mod pipeline automatically detects format mismatches and converts replacement audio files to match the original:
 
-- **Bit depth** (8/16/24/32-bit) and **channel count** (mono/stereo) changes are handled in pure Python — no extra tools needed
-- **Sample rate** changes (e.g. 48kHz → 44.1kHz) use ffmpeg, which is installed on-demand in WSL/Docker if needed
-- **OGG** files pass through as-is — the game's audio engine (Allegro 5.2) decodes OGG natively at any sample rate
+- **WAV bit depth** (8/16/24/32-bit) and **channel count** (mono/stereo) changes are handled in pure Python — no extra tools needed
+- **WAV sample rate** changes (e.g. 48kHz → 44.1kHz) use ffmpeg, installed on-demand in WSL/Docker if needed
+- **OGG Vorbis** files are checked for channel count, sample rate, and bitrate — mismatches are re-encoded via ffmpeg to match the original
 - **Compressed WAV** files (non-PCM codecs like ADPCM or MP3-in-WAV) are converted via ffmpeg
 
 The conversion is logged so you can see exactly what was changed:
 ```
 Audio format mismatch: 2ch->1ch, 48000Hz->44100Hz
 Converted (ffmpeg): 2ch/16bit/48000Hz -> 1ch/16bit/44100Hz
+
+OGG format mismatch: 1ch->2ch, 48000Hz->44100Hz, 128kbps->112kbps
+Converted (ffmpeg): 1ch/48000Hz/128kbps -> 2ch/44100Hz/112kbps
 ```
 
 #### Video Format
