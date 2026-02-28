@@ -4188,6 +4188,103 @@ class DirectSSDModPipeline(StandaloneModPipeline):
     _cleanup_ssd = DirectSSDDecryptPipeline._cleanup_ssd
 
 
+def export_mod_pack(assets_folder, output_zip, log_cb=None, progress_cb=None):
+    """Scan assets folder for modified files and package them into a zip.
+
+    The zip contains:
+    - Only files that differ from the baseline .checksums.md5
+    - fl_decrypted.dat (needed for CRC forgery when applying the pack)
+    - .checksums.md5 (so the recipient can apply further mods on top)
+
+    Returns (num_changed, zip_path) on success, raises PipelineError on failure.
+    """
+    import hashlib
+    import os
+    import re
+    import zipfile
+
+    def log(msg, level="info"):
+        if log_cb:
+            log_cb(msg, level)
+
+    checksums_file = os.path.join(assets_folder, '.checksums.md5')
+    if not os.path.isfile(checksums_file):
+        raise PipelineError("Export",
+            "No .checksums.md5 found in the assets folder.\n"
+            "Run Decrypt first to generate baseline checksums.")
+
+    fl_dat_path = os.path.join(assets_folder, 'fl_decrypted.dat')
+    if not os.path.isfile(fl_dat_path):
+        raise PipelineError("Export",
+            "No fl_decrypted.dat found in the assets folder.\n"
+            "Run Decrypt first to generate the file list.")
+
+    # Load saved checksums
+    saved = {}
+    with open(checksums_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            m = re.match(r'^([a-f0-9]{32})\s+\*?(.+)$', line)
+            if m:
+                filepath = m.group(2)
+                if filepath.startswith('./'):
+                    filepath = filepath[2:]
+                saved[filepath] = m.group(1)
+
+    log(f"Loaded {len(saved)} baseline checksums.", "info")
+
+    # Collect files to scan
+    all_files = []
+    for root, _dirs, files in os.walk(assets_folder):
+        for name in files:
+            if name.startswith('.') or name == 'fl_decrypted.dat' or name.endswith('.img'):
+                continue
+            full_path = os.path.join(root, name)
+            rel_path = os.path.relpath(full_path, assets_folder).replace('\\', '/')
+            if rel_path in saved:
+                all_files.append((rel_path, full_path))
+
+    total = len(all_files)
+    log(f"Checking {total} files for changes...", "info")
+
+    changed = []
+    for i, (rel_path, full_path) in enumerate(all_files):
+        h = hashlib.md5()
+        with open(full_path, 'rb') as fh:
+            for chunk in iter(lambda: fh.read(65536), b''):
+                h.update(chunk)
+        if saved[rel_path] != h.hexdigest():
+            changed.append((rel_path, full_path))
+            log(f"  Modified: {rel_path}", "info")
+        if progress_cb and ((i + 1) % 500 == 0 or i + 1 == total):
+            progress_cb(i + 1, total, f"{len(changed)} changed so far")
+
+    if not changed:
+        raise PipelineError("Export",
+            "No modified files detected.\n"
+            "Modify files in the output folder first, then export.")
+
+    log(f"Found {len(changed)} modified file(s). Creating mod pack...", "info")
+
+    with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # Add changed files
+        for rel_path, full_path in changed:
+            zf.write(full_path, rel_path)
+
+        # Include fl_decrypted.dat and checksums for the recipient
+        zf.write(fl_dat_path, 'fl_decrypted.dat')
+        zf.write(checksums_file, '.checksums.md5')
+
+    zip_size = os.path.getsize(output_zip)
+    size_mb = zip_size / (1024 * 1024)
+    log(f"Mod pack saved: {output_zip} ({size_mb:.1f} MB, "
+        f"{len(changed)} file(s))", "success")
+
+    return len(changed), output_zip
+
+
 def check_prerequisites(executor, standalone=False):
     """Check all prerequisites. Returns list of (name, passed, message) tuples."""
     import sys as _sys

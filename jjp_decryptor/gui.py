@@ -103,7 +103,8 @@ class MainWindow:
                  on_theme_change=None, initial_theme=None,
                  on_install_prereqs=None,
                  on_ssd_decrypt=None, on_ssd_modify=None,
-                 on_ssd_cancel=None, on_ssd_refresh=None):
+                 on_ssd_cancel=None, on_ssd_refresh=None,
+                 on_export_mod_pack=None):
         self.root = root
         self._on_check_prereqs = on_check_prereqs
         self._on_start = on_start
@@ -117,6 +118,7 @@ class MainWindow:
         self._on_ssd_modify = on_ssd_modify
         self._on_ssd_cancel = on_ssd_cancel
         self._on_ssd_refresh = on_ssd_refresh
+        self._on_export_mod_pack = on_export_mod_pack
 
         # Title is set by App (includes version); fallback here for standalone use
         if not root.title():
@@ -542,6 +544,17 @@ class MainWindow:
             command=self._on_ssd_cancel, state=tk.DISABLED)
         self.ssd_cancel_btn.pack(side=tk.LEFT, padx=4)
 
+        # Separator + Export button
+        ttk.Separator(btn_row, orient=tk.VERTICAL).pack(
+            side=tk.LEFT, padx=8, fill=tk.Y, pady=2)
+        self.export_mod_pack_btn = ttk.Button(
+            btn_row, text="Export Mod Pack",
+            command=self._on_export_mod_pack)
+        self.export_mod_pack_btn.pack(side=tk.LEFT, padx=4)
+        _Tooltip(self.export_mod_pack_btn,
+                 "Package modified files into a shareable zip",
+                 lambda: self._current_theme)
+
         # Store device list for mapping combo index -> DiskInfo
         self._ssd_devices = []
 
@@ -803,6 +816,7 @@ class MainWindow:
             self.mod_apply_btn.configure(state=tk.DISABLED)
             self.ssd_decrypt_btn.configure(state=tk.DISABLED)
             self.ssd_modify_btn.configure(state=tk.DISABLED)
+            self.export_mod_pack_btn.configure(state=tk.DISABLED)
             if mode in ("decrypt", "decrypt_standalone"):
                 self.cancel_btn.configure(state=tk.NORMAL)
             elif mode in ("ssd_decrypt", "ssd_modify"):
@@ -822,6 +836,7 @@ class MainWindow:
             self.ssd_decrypt_btn.configure(state=tk.NORMAL)
             self.ssd_modify_btn.configure(state=tk.NORMAL)
             self.ssd_cancel_btn.configure(state=tk.DISABLED)
+            self.export_mod_pack_btn.configure(state=tk.NORMAL)
             # Stop any indeterminate animation and fill to 100%
             self.progress.stop()
             self.progress.configure(mode="determinate", maximum=100, value=100)

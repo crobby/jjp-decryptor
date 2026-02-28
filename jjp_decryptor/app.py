@@ -12,7 +12,7 @@ from .gui import MainWindow
 from .pipeline import (DecryptionPipeline, ModPipeline,
                         StandaloneDecryptPipeline, StandaloneModPipeline,
                         DirectSSDDecryptPipeline, DirectSSDModPipeline,
-                        check_prerequisites)
+                        check_prerequisites, export_mod_pack)
 from .updater import check_for_update
 from .executor import create_executor
 import sys
@@ -95,6 +95,7 @@ class App:
             on_ssd_modify=self._ssd_modify,
             on_ssd_cancel=self._ssd_cancel,
             on_ssd_refresh=self._ssd_refresh,
+            on_export_mod_pack=self._export_mod_pack,
         )
 
         # Detect game name when file is selected (register before loading settings
@@ -689,6 +690,87 @@ class App:
         if self.pipeline:
             self.window.append_log("Cancelling...", "error")
             self.pipeline.cancel()
+
+    # --- Mod pack export ---
+
+    def _export_mod_pack(self):
+        """Export modified files from the output folder into a shareable zip."""
+        from tkinter import filedialog as fd
+
+        output_path = self.window.output_var.get().strip()
+        if not output_path:
+            messagebox.showwarning("Missing Input",
+                "Please select an output folder first.")
+            return
+        if not os.path.isdir(output_path):
+            messagebox.showerror("Invalid Folder",
+                f"Output folder does not exist:\n{output_path}")
+            return
+
+        checksums_file = os.path.join(output_path, '.checksums.md5')
+        if not os.path.isfile(checksums_file):
+            messagebox.showerror("No Baseline Checksums",
+                "No .checksums.md5 file found in the output folder.\n\n"
+                "Run Decrypt first to generate baseline checksums, then "
+                "modify files and try again.")
+            return
+
+        fl_dat = os.path.join(output_path, 'fl_decrypted.dat')
+        if not os.path.isfile(fl_dat):
+            messagebox.showerror("Missing File List",
+                "No fl_decrypted.dat found in the output folder.\n\n"
+                "Run Decrypt first to generate the file list.")
+            return
+
+        # Try to detect game name for default filename
+        game_name = ""
+        from . import config
+        folder_name = os.path.basename(output_path).lower()
+        for key in config.KNOWN_GAMES:
+            if key.lower() in folder_name:
+                game_name = key + "_"
+                break
+
+        zip_path = fd.asksaveasfilename(
+            title="Save Mod Pack As",
+            defaultextension=".zip",
+            initialfile=f"{game_name}mod_pack.zip",
+            filetypes=[("Zip files", "*.zip"), ("All files", "*.*")],
+        )
+        if not zip_path:
+            return  # User cancelled
+
+        self.window.append_log("Exporting mod pack...", "info")
+
+        def log_cb(text, level="info"):
+            self.msg_queue.put(LogMsg(text, level))
+
+        def progress_cb(current, total, desc=""):
+            self.msg_queue.put(ProgressMsg(current, total, desc))
+
+        def _run():
+            try:
+                num_changed, path = export_mod_pack(
+                    output_path, zip_path,
+                    log_cb=log_cb, progress_cb=progress_cb,
+                )
+                self.msg_queue.put(LogMsg(
+                    f"Mod pack exported successfully with {num_changed} file(s).",
+                    "success"))
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Export Complete",
+                    f"Mod pack saved to:\n{path}\n\n"
+                    f"Contains {num_changed} modified file(s).\n\n"
+                    f"Share this zip with other users. They can apply it by:\n"
+                    f"1. Decrypting their own game first\n"
+                    f"2. Extracting the zip over their output folder\n"
+                    f"3. Running Apply Mods (ISO or SSD)"))
+            except Exception as e:
+                self.msg_queue.put(LogMsg(f"Export failed: {e}", "error"))
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Export Failed", str(e)))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     # --- Common ---
 
