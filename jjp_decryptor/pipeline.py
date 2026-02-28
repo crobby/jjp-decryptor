@@ -3422,7 +3422,10 @@ class StandaloneModPipeline(ModPipeline):
 
     def _verify_raw_image(self, wsl_img):
         """Spot-check that modifications survived unmount by mounting the raw
-        image read-only and comparing against expected encrypted bytes."""
+        image read-only and comparing against expected encrypted bytes.
+
+        Raises PipelineError if verification fails — the ISO would be broken.
+        """
         import uuid as _uuid
         tag = _uuid.uuid4().hex[:8]
         check_mp = f"/var/tmp/jjp_check_{tag}"
@@ -3437,6 +3440,7 @@ class StandaloneModPipeline(ModPipeline):
         entry = entry_map.get(full_path)
 
         expected = getattr(self, '_expected_spot', None)
+        verification_failed = False
 
         self.log("Verifying modifications persisted in raw image...", "info")
         try:
@@ -3447,7 +3451,7 @@ class StandaloneModPipeline(ModPipeline):
 
             # Get MD5 and size of the encrypted file on disk
             raw_md5 = self.executor.run(
-                f"md5sum '{check_path}' | cut -d' ' -f1", timeout=30).strip()
+                f"md5sum '{check_path}' | cut -d' ' -f1", timeout=60).strip()
             raw_size = int(self.executor.run(
                 f"stat -c%s '{check_path}'", timeout=5).strip())
 
@@ -3461,8 +3465,9 @@ class StandaloneModPipeline(ModPipeline):
                         f"(md5={raw_md5[:12]}…, size={raw_size})",
                         "success")
                 else:
+                    verification_failed = True
                     self.log(
-                        f"  WARNING: Encrypted bytes do NOT match!",
+                        f"  FAILED: Encrypted bytes do NOT match!",
                         "error")
                     self.log(
                         f"    Expected: md5={expected['md5'][:12]}… "
@@ -3474,7 +3479,7 @@ class StandaloneModPipeline(ModPipeline):
 
             # Read the encrypted file back, decrypt it, and compare content
             # against the replacement file to prove the round-trip works.
-            if entry:
+            if entry and not verification_failed:
                 import base64 as _b64
                 enc_b64 = self.executor.run(
                     f"base64 '{check_path}'", timeout=120).strip()
@@ -3497,8 +3502,9 @@ class StandaloneModPipeline(ModPipeline):
                         f"(md5={disk_content_md5[:12]}…)",
                         "success")
                 else:
+                    verification_failed = True
                     self.log(
-                        f"  WARNING: Decrypted content does NOT match "
+                        f"  FAILED: Decrypted content does NOT match "
                         f"replacement file!",
                         "error")
                     self.log(
@@ -3507,11 +3513,6 @@ class StandaloneModPipeline(ModPipeline):
                     self.log(
                         f"    On disk:     md5={disk_content_md5[:12]}…",
                         "error")
-                    if expected and disk_content_md5 != expected.get('content_md5'):
-                        self.log(
-                            f"    Expected:    md5="
-                            f"{expected['content_md5'][:12]}…",
-                            "error")
 
             self.executor.run(
                 f"umount -l '{check_mp}' 2>/dev/null; "
@@ -3525,27 +3526,80 @@ class StandaloneModPipeline(ModPipeline):
             except CommandError:
                 pass
 
+        if verification_failed:
+            raise PipelineError(
+                "Verification",
+                "Modified files did not persist to the raw image.\n\n"
+                "This is typically caused by WSL2 not flushing writes to disk "
+                "before unmounting. The ISO was NOT built.\n\n"
+                "Please try again. If this keeps happening, try:\n"
+                "  1. Run 'wsl --shutdown' in a Windows terminal\n"
+                "  2. Close other programs using WSL\n"
+                "  3. Restart the mod pipeline"
+            )
+
     def _phase_convert_standalone(self):
         """Unmount and convert - same as parent but no bind mounts to clean."""
         if self.mount_point:
+            mp = self.mount_point
+            wsl_img = self._raw_img_path
+
+            # ---- Aggressive flush sequence ----
+            # WSL2's 9p filesystem can delay writes to the underlying image.
+            # We must ensure all data is on disk BEFORE unmounting.
             self.log("Syncing filesystem before unmount...", "info")
             try:
+                # 1. sync the specific mount point
+                self.executor.run(f"sync -f '{mp}/'", timeout=60)
+            except CommandError:
+                pass
+            try:
+                # 2. global sync
                 self.executor.run("sync", timeout=30)
             except CommandError:
                 pass
-
-            self.log("Unmounting ext4 for conversion...", "info")
             try:
+                # 3. drop caches to force dirty pages to disk
                 self.executor.run(
-                    f"umount '{self.mount_point}'", timeout=30)
+                    "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; true",
+                    timeout=10)
             except CommandError:
-                self.log("Clean unmount failed, trying lazy unmount...", "info")
-                self.executor.run(
-                    f"umount -l '{self.mount_point}' 2>/dev/null; true",
-                    timeout=30)
+                pass
+
+            # ---- Unmount with retry ----
+            self.log("Unmounting ext4 for conversion...", "info")
+            unmounted = False
+            for attempt in range(3):
+                try:
+                    self.executor.run(
+                        f"umount '{mp}'", timeout=30)
+                    unmounted = True
+                    break
+                except CommandError:
+                    if attempt < 2:
+                        self.log(f"  Unmount attempt {attempt + 1} failed, "
+                                 "waiting for I/O to settle...", "info")
+                        try:
+                            self.executor.run("sync; sleep 2; sync",
+                                              timeout=15)
+                        except CommandError:
+                            pass
+
+            if not unmounted:
+                self.log("Clean unmount failed after 3 attempts. "
+                         "Trying lazy unmount...", "error")
+                try:
+                    self.executor.run(
+                        f"umount -l '{mp}' 2>/dev/null; true",
+                        timeout=30)
+                    # After lazy unmount, wait for I/O to flush
+                    self.executor.run("sync; sleep 3; sync", timeout=30)
+                except CommandError:
+                    pass
+
             try:
                 self.executor.run(
-                    f"rmdir '{self.mount_point}' 2>/dev/null; true", timeout=5)
+                    f"rmdir '{mp}' 2>/dev/null; true", timeout=5)
             except CommandError:
                 pass
             self.mount_point = None
