@@ -1,6 +1,7 @@
 """Decryption pipeline - orchestrates the 7-phase decryption process."""
 
 import base64
+import os
 import re
 import subprocess
 import sys
@@ -10,6 +11,44 @@ import uuid
 from . import config
 from .resources import DECRYPT_C_SOURCE, ENCRYPT_C_SOURCE, STUB_C_SOURCE
 from .executor import CommandError, create_executor, find_usbipd
+
+
+def _find_project_file(filename):
+    """Locate a project-level file (e.g. partclone_to_raw.py).
+
+    Works for both source installs and macOS PyInstaller .app bundles,
+    where __file__ is inside Contents/Frameworks/ but --add-data files
+    land in Contents/Resources/.
+    """
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    # Source install: file is one level above the package
+    candidate = os.path.join(os.path.dirname(pkg_dir), filename)
+    if os.path.isfile(candidate):
+        return candidate
+    # macOS .app bundle: check Contents/Resources/
+    resources = os.path.join(pkg_dir, "..", "Resources", filename)
+    if os.path.isfile(resources):
+        return os.path.abspath(resources)
+    return candidate  # fall back to original (will fail with clear error)
+
+
+def _project_dirs():
+    """Return directories that contain project files.
+
+    For source installs this is just the directory containing jjp_decryptor/.
+    For macOS .app bundles, both Contents/Frameworks/ (Python code) and
+    Contents/Resources/ (--add-data files like partclone_to_raw.py) are needed.
+    """
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    parent = os.path.dirname(pkg_dir)
+    dirs = [parent]
+    # macOS .app bundle: Resources/ is a sibling of Frameworks/
+    resources = os.path.join(pkg_dir, "..", "Resources")
+    if os.path.isdir(resources):
+        resources = os.path.abspath(resources)
+        if resources != parent:
+            dirs.append(resources)
+    return dirs
 
 
 # Python script deployed to WSL for standalone decryption.
@@ -427,9 +466,7 @@ class DecryptionPipeline:
         # Fall back to native partclone.restore only if Python script is unavailable.
         self._check_cancel()
 
-        import os
-        script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        script_path = os.path.join(script_dir, "partclone_to_raw.py")
+        script_path = _find_project_file("partclone_to_raw.py")
 
         if os.path.isfile(script_path):
             self._extract_with_python(parts, script_path)
@@ -558,9 +595,7 @@ class DecryptionPipeline:
         """Use the proven Python partclone converter."""
         self.log("Using Python partclone converter...", "info")
         if script_path is None:
-            import os
-            script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            script_path = os.path.join(script_dir, "partclone_to_raw.py")
+            script_path = _find_project_file("partclone_to_raw.py")
 
         wsl_script = self.executor.to_exec_path(script_path)
         parts_str = " ".join(f"'{p}'" for p in parts)
@@ -2537,9 +2572,8 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
             # Start Docker container if on macOS
             if isinstance(self.executor, DockerExecutor):
                 self.log("Starting Docker container...", "info")
-                project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 self.executor.start_container([
-                    self.image_path, self.output_path, project_dir])
+                    self.image_path, self.output_path, *_project_dirs()])
 
             self.on_phase(0)  # Extract
             self._phase_extract()
@@ -2812,9 +2846,8 @@ class StandaloneModPipeline(ModPipeline):
             # Start Docker container if on macOS
             if isinstance(self.executor, DockerExecutor):
                 self.log("Starting Docker container...", "info")
-                project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                 self.executor.start_container([
-                    self.image_path, self.assets_folder, project_dir])
+                    self.image_path, self.assets_folder, *_project_dirs()])
 
             self.on_phase(0)  # Scan
             self._phase_scan()

@@ -283,7 +283,7 @@ flowchart TD
 
     B -.- B1["Compare output folder against .checksums.md5\nto find modified files"]
     C -.- C1["Fresh extraction from original ISO"]
-    E -.- E1["For each changed file:\n1. Pad with filler + CRC32-forged suffix\n2. XOR-encrypt with same keystream\n3. Forge filler bytes for encrypted CRC match\n4. Verify both CRC32s\n5. Restore original fl.dat unmodified"]
+    E -.- E1["For each changed file:\n1. Auto-convert audio format if needed\n2. Pad with filler + CRC32-forged suffix\n3. XOR-encrypt with same keystream\n4. Forge filler bytes for encrypted CRC match\n5. Verify both CRC32s\n6. Restore original fl.dat unmodified"]
     F -.- F1["Unmount → e2fsck → partclone.ext4 -c\npigz --fast -b 1024 --rsyncable\nSplit into 1GB chunks"]
     G -.- G1["xorriso splices new partition chunks\ninto original ISO preserving boot records"]
 ```
@@ -293,8 +293,8 @@ flowchart TD
 | **Scan** | Compares output folder against `.checksums.md5` baseline to identify modified files |
 | **Extract** | Extracts a **fresh** ext4 image from the original ISO (never reuses previous images) |
 | **Mount** | Loop-mounts the fresh ext4 image read-write |
-| **Encrypt** | For each changed file: reads replacement content, encrypts with pure Python crypto, forges both CRC32 checksums, writes encrypted file back into the ext4 image. Restores original `fl.dat` unmodified |
-| **Convert** | Unmounts ext4, runs `e2fsck -fy`, converts to partclone format with `pigz --fast -b 1024 --rsyncable`, splits into ~1GB chunks matching the original layout |
+| **Encrypt** | For each changed file: reads replacement content, auto-converts audio if format mismatches original (WAV/OGG), encrypts with pure Python crypto, forges both CRC32 checksums, writes encrypted file back into the ext4 image. Restores original `fl.dat` unmodified |
+| **Convert** | Syncs and unmounts ext4 (with retry and verification that writes persisted), runs `e2fsck -fy`, converts to partclone format with `pigz --fast -b 1024 --rsyncable`, splits into ~1GB chunks matching the original layout |
 | **Build ISO** | Uses `xorriso` to splice the new partition chunks into the original ISO, preserving all boot records (MBR, El Torito, EFI, Syslinux) |
 | **Cleanup** | Unmounts everything, removes temp files and raw images |
 
@@ -338,6 +338,12 @@ The app detects and cleans up stale mounts automatically on startup. If you have
 ```
 wsl -u root -- bash -c "findmnt -rn -o TARGET | grep /mnt/jjp_ | sort -r | xargs -r umount -lf; rmdir /mnt/jjp_* 2>/dev/null"
 ```
+
+### "Modified files did not persist" error (Windows)
+If the mod pipeline aborts with this error, it means WSL2 did not flush writes to the disk image before unmounting. The tool detects this and stops before building a broken ISO. To fix:
+1. Run `wsl --shutdown` in a Windows terminal, then retry
+2. Close other programs using WSL (terminals, VS Code Remote, etc.)
+3. If you use Norton, Avast, or similar antivirus, try temporarily disabling real-time protection — some AV products interfere with WSL2 disk I/O
 
 ### Mount fails with "bad superblock"
 This can happen if partclone.restore produces a truncated image. The tool automatically detects and fixes this by reading the ext4 superblock and extending the image to full filesystem size. If it still fails, delete cached images and retry:
