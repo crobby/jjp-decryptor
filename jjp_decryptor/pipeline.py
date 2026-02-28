@@ -4346,6 +4346,43 @@ def export_mod_pack(assets_folder, output_zip, log_cb=None, progress_cb=None):
     return len(changed), output_zip
 
 
+def import_mod_pack(zip_path, assets_folder, log_cb=None, progress_cb=None):
+    """Extract a mod pack ZIP into the assets folder.
+
+    Overwrites files in assets_folder with the contents of the zip.
+    Returns the number of files extracted.
+    """
+    import os
+    import zipfile
+
+    def log(msg, level="info"):
+        if log_cb:
+            log_cb(msg, level)
+
+    if not os.path.isfile(zip_path):
+        raise PipelineError("Import", f"Mod pack not found: {zip_path}")
+
+    if not os.path.isdir(assets_folder):
+        raise PipelineError("Import",
+            f"Output folder does not exist:\n{assets_folder}")
+
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        members = [m for m in zf.namelist() if not m.endswith('/')]
+        total = len(members)
+        if total == 0:
+            raise PipelineError("Import", "Mod pack is empty.")
+
+        log(f"Extracting {total} file(s) from mod pack...", "info")
+
+        for i, name in enumerate(members):
+            zf.extract(name, assets_folder)
+            if progress_cb and ((i + 1) % 100 == 0 or i + 1 == total):
+                progress_cb(i + 1, total, name)
+
+    log(f"Imported {total} file(s) into {assets_folder}", "success")
+    return total
+
+
 def check_prerequisites(executor, standalone=False):
     """Check all prerequisites. Returns list of (name, passed, message) tuples."""
     import sys as _sys

@@ -12,7 +12,8 @@ from .gui import MainWindow
 from .pipeline import (DecryptionPipeline, ModPipeline,
                         StandaloneDecryptPipeline, StandaloneModPipeline,
                         DirectSSDDecryptPipeline, DirectSSDModPipeline,
-                        check_prerequisites, export_mod_pack)
+                        check_prerequisites, export_mod_pack,
+                        import_mod_pack)
 from .updater import check_for_update
 from .executor import create_executor
 import sys
@@ -91,11 +92,6 @@ class App:
             on_theme_change=self._on_theme_change,
             initial_theme=saved_theme,
             on_install_prereqs=self._install_prereqs,
-            on_ssd_decrypt=self._ssd_decrypt,
-            on_ssd_modify=self._ssd_modify,
-            on_ssd_cancel=self._ssd_cancel,
-            on_ssd_refresh=self._ssd_refresh,
-            on_export_mod_pack=self._export_mod_pack,
         )
 
         # Detect game name when file is selected (register before loading settings
@@ -358,7 +354,7 @@ class App:
 
         threading.Thread(target=_run, daemon=True).start()
 
-    # --- Decrypt pipeline ---
+    # --- Create Mods (decrypt) ---
 
     def _find_fl_dat(self):
         """Look for a cached fl_decrypted.dat in the output folder."""
@@ -370,7 +366,16 @@ class App:
         return None
 
     def _start(self):
-        """Start the decryption pipeline."""
+        """Start the Create Mods action (dispatches based on Create radio)."""
+        source = self.window.get_create_source()
+        if source == "ssd":
+            self._start_ssd_decrypt()
+            return
+        if source == "export":
+            self._start_export()
+            return
+
+        # ISO decrypt
         image_path = self.window.image_var.get().strip()
         output_path = self.window.output_var.get().strip()
 
@@ -396,8 +401,7 @@ class App:
 
         self._save_settings()
 
-        # Always use standalone mode — no dongle required
-        fl_dat_path = self._find_fl_dat()  # may be None (dongle-free scan)
+        fl_dat_path = self._find_fl_dat()
 
         self._active_mode = "decrypt_standalone"
         self.window.set_running(True, mode=self._active_mode)
@@ -436,103 +440,7 @@ class App:
 
         threading.Thread(target=self.pipeline.run, daemon=True).start()
 
-    def _cancel(self):
-        """Cancel the running decrypt pipeline."""
-        if self.pipeline:
-            self.window.append_log("Cancelling...", "error")
-            self.pipeline.cancel()
-
-    # --- Mod pipeline ---
-
-    def _mod_start(self):
-        """Start the asset modification pipeline."""
-        image_path = self.window.image_var.get().strip()
-        output_path = self.window.output_var.get().strip()
-
-        if not image_path:
-            messagebox.showwarning("Missing Input",
-                "Please select a game image file.")
-            return
-        if not output_path:
-            messagebox.showwarning("Missing Input",
-                "Please select an output folder (containing your modified assets).")
-            return
-        if not os.path.isdir(output_path):
-            messagebox.showerror("Invalid Folder",
-                f"Output folder does not exist:\n{output_path}")
-            return
-
-        checksums_file = os.path.join(output_path, '.checksums.md5')
-        if not os.path.isfile(checksums_file):
-            messagebox.showerror("No Baseline Checksums",
-                "No .checksums.md5 file found in the output folder.\n\n"
-                "Run Decrypt first to generate baseline checksums, then "
-                "modify files in the output folder and try again.")
-            return
-
-        if not image_path.lower().endswith(".iso"):
-            proceed = messagebox.askyesno("Non-ISO Input",
-                "The selected image is not an ISO file.\n\n"
-                "Modify Assets can still encrypt your changes, but the output "
-                "will be a raw .img file instead of a bootable Clonezilla ISO.\n\n"
-                "For a flashable ISO, select the original Clonezilla ISO.\n\n"
-                "Continue anyway?")
-            if not proceed:
-                return
-
-        self._save_settings()
-
-        # Always use standalone mode — no dongle required
-        # Mod pipeline requires fl_decrypted.dat (needs CRC values for forgery)
-        fl_dat_path = self._find_fl_dat()
-
-        self._active_mode = "modify_standalone"
-        self.window.set_running(True, mode=self._active_mode)
-        self.window.reset_steps(mode=self._active_mode)
-
-        def log_cb(text, level="info"):
-            self.msg_queue.put(LogMsg(text, level))
-
-        def phase_cb(index):
-            self.msg_queue.put(PhaseMsg(index))
-
-        def progress_cb(current, total, desc=""):
-            self.msg_queue.put(ProgressMsg(current, total, desc))
-
-        def done_cb(success, summary):
-            self.msg_queue.put(DoneMsg(success, summary))
-
-        if not fl_dat_path:
-            messagebox.showerror(
-                "Missing File List",
-                "No fl_decrypted.dat found in the output folder.\n\n"
-                "Run Decrypt first to generate the file list, then try "
-                "Modify again.")
-            return
-
-        log_cb(f"Using cached file list: {fl_dat_path}", "success")
-        log_cb("No dongle, chroot, or gcc required.", "success")
-        self.pipeline = StandaloneModPipeline(
-            image_path, output_path, fl_dat_path,
-            log_cb, phase_cb, progress_cb, done_cb,
-        )
-
-        self.pipeline.log_link = lambda text, url: self.msg_queue.put(LinkMsg(text, url))
-        threading.Thread(target=self.pipeline.run, daemon=True).start()
-
-    def _mod_cancel(self):
-        """Cancel the running mod pipeline."""
-        if self.pipeline:
-            self.window.append_log("Cancelling...", "error")
-            self.pipeline.cancel()
-
-    # --- Direct SSD pipeline ---
-
-    def _ssd_refresh(self):
-        """Callback after GUI refreshes device list (placeholder for future use)."""
-        pass
-
-    def _ssd_decrypt(self):
+    def _start_ssd_decrypt(self):
         """Start the direct SSD decryption pipeline."""
         device = self.window.get_ssd_device()
         output_path = self.window.output_var.get().strip()
@@ -544,7 +452,7 @@ class App:
             return
         if not output_path:
             messagebox.showwarning("Missing Input",
-                "Please select an output folder on the Decrypt tab first.")
+                "Please select an output folder.")
             return
 
         # Warn if output folder already has decrypted content
@@ -593,7 +501,7 @@ class App:
         else:
             log_cb("No cached file list found. Will scan filesystem "
                    "and auto-detect filler sizes.", "info")
-        log_cb("Direct SSD mode — no ISO extraction needed.", "success")
+        log_cb("Direct SSD mode \u2014 no ISO extraction needed.", "success")
 
         self.pipeline = DirectSSDDecryptPipeline(
             device.device_id, output_path, fl_dat_path,
@@ -609,7 +517,98 @@ class App:
 
         threading.Thread(target=self.pipeline.run, daemon=True).start()
 
-    def _ssd_modify(self):
+    def _cancel(self):
+        """Cancel the running pipeline."""
+        if self.pipeline:
+            self.window.append_log("Cancelling...", "error")
+            self.pipeline.cancel()
+
+    # --- Install Mods (modify / export) ---
+
+    def _mod_start(self):
+        """Start the Install Mods action (dispatches based on Install radio)."""
+        method = self.window.get_install_method()
+        if method == "ssd":
+            self._start_ssd_modify()
+            return
+        if method == "import":
+            self._start_import()
+            return
+
+        # ISO modify
+        image_path = self.window.image_var.get().strip()
+        output_path = self.window.output_var.get().strip()
+
+        if not image_path:
+            messagebox.showwarning("Missing Input",
+                "Please select a game image file.")
+            return
+        if not output_path:
+            messagebox.showwarning("Missing Input",
+                "Please select an output folder (containing your modified assets).")
+            return
+        if not os.path.isdir(output_path):
+            messagebox.showerror("Invalid Folder",
+                f"Output folder does not exist:\n{output_path}")
+            return
+
+        checksums_file = os.path.join(output_path, '.checksums.md5')
+        if not os.path.isfile(checksums_file):
+            messagebox.showerror("No Baseline Checksums",
+                "No .checksums.md5 file found in the output folder.\n\n"
+                "Run Create Mods first to generate baseline checksums, then "
+                "modify files in the output folder and try again.")
+            return
+
+        if not image_path.lower().endswith(".iso"):
+            proceed = messagebox.askyesno("Non-ISO Input",
+                "The selected image is not an ISO file.\n\n"
+                "Build USB ISO can still encrypt your changes, but the output "
+                "will be a raw .img file instead of a bootable Clonezilla ISO.\n\n"
+                "For a flashable ISO, select the original Clonezilla ISO.\n\n"
+                "Continue anyway?")
+            if not proceed:
+                return
+
+        self._save_settings()
+
+        fl_dat_path = self._find_fl_dat()
+
+        self._active_mode = "modify_standalone"
+        self.window.set_running(True, mode=self._active_mode)
+        self.window.reset_steps(mode=self._active_mode)
+
+        def log_cb(text, level="info"):
+            self.msg_queue.put(LogMsg(text, level))
+
+        def phase_cb(index):
+            self.msg_queue.put(PhaseMsg(index))
+
+        def progress_cb(current, total, desc=""):
+            self.msg_queue.put(ProgressMsg(current, total, desc))
+
+        def done_cb(success, summary):
+            self.msg_queue.put(DoneMsg(success, summary))
+
+        if not fl_dat_path:
+            messagebox.showerror(
+                "Missing File List",
+                "No fl_decrypted.dat found in the output folder.\n\n"
+                "Run Create Mods first to generate the file list, then try "
+                "again.")
+            return
+
+        log_cb(f"Using cached file list: {fl_dat_path}", "success")
+        log_cb("No dongle, chroot, or gcc required.", "success")
+        self.pipeline = StandaloneModPipeline(
+            image_path, output_path, fl_dat_path,
+            log_cb, phase_cb, progress_cb, done_cb,
+        )
+
+        self.pipeline.log_link = lambda text, url: self.msg_queue.put(LinkMsg(text, url))
+        threading.Thread(target=self.pipeline.run, daemon=True).start()
+
+    def _start_ssd_modify(self):
         """Start the direct SSD modification pipeline."""
         device = self.window.get_ssd_device()
         output_path = self.window.output_var.get().strip()
@@ -621,8 +620,7 @@ class App:
             return
         if not output_path:
             messagebox.showwarning("Missing Input",
-                "Please select an output folder (containing your modified assets) "
-                "on the Decrypt tab first.")
+                "Please select an output folder (containing your modified assets).")
             return
         if not os.path.isdir(output_path):
             messagebox.showerror("Invalid Folder",
@@ -633,7 +631,7 @@ class App:
         if not os.path.isfile(checksums_file):
             messagebox.showerror("No Baseline Checksums",
                 "No .checksums.md5 file found in the output folder.\n\n"
-                "Run Decrypt first to generate baseline checksums, then "
+                "Run Create Mods first to generate baseline checksums, then "
                 "modify files in the output folder and try again.")
             return
 
@@ -642,8 +640,8 @@ class App:
             messagebox.showerror(
                 "Missing File List",
                 "No fl_decrypted.dat found in the output folder.\n\n"
-                "Run Decrypt first to generate the file list, then try "
-                "Modify again.")
+                "Run Create Mods first to generate the file list, then try "
+                "again.")
             return
 
         # Confirm device selection — this modifies a physical drive
@@ -676,7 +674,7 @@ class App:
             self.msg_queue.put(DoneMsg(success, summary))
 
         log_cb(f"Using cached file list: {fl_dat_path}", "success")
-        log_cb("Direct SSD mod mode — writing directly to drive.", "info")
+        log_cb("Direct SSD mod mode \u2014 writing directly to drive.", "info")
 
         self.pipeline = DirectSSDModPipeline(
             device.device_id, output_path, fl_dat_path,
@@ -685,15 +683,7 @@ class App:
         self.pipeline.log_link = lambda text, url: self.msg_queue.put(LinkMsg(text, url))
         threading.Thread(target=self.pipeline.run, daemon=True).start()
 
-    def _ssd_cancel(self):
-        """Cancel the running SSD pipeline."""
-        if self.pipeline:
-            self.window.append_log("Cancelling...", "error")
-            self.pipeline.cancel()
-
-    # --- Mod pack export ---
-
-    def _export_mod_pack(self):
+    def _start_export(self):
         """Export modified files from the output folder into a shareable zip."""
         from tkinter import filedialog as fd
 
@@ -711,7 +701,7 @@ class App:
         if not os.path.isfile(checksums_file):
             messagebox.showerror("No Baseline Checksums",
                 "No .checksums.md5 file found in the output folder.\n\n"
-                "Run Decrypt first to generate baseline checksums, then "
+                "Run Create Mods first to generate baseline checksums, then "
                 "modify files and try again.")
             return
 
@@ -719,7 +709,7 @@ class App:
         if not os.path.isfile(fl_dat):
             messagebox.showerror("Missing File List",
                 "No fl_decrypted.dat found in the output folder.\n\n"
-                "Run Decrypt first to generate the file list.")
+                "Run Create Mods first to generate the file list.")
             return
 
         # Try to detect game name for default filename
@@ -764,13 +754,79 @@ class App:
                     f"Share this zip with other users. They can apply it by:\n"
                     f"1. Decrypting their own game first\n"
                     f"2. Extracting the zip over their output folder\n"
-                    f"3. Running Apply Mods (ISO or SSD)"))
+                    f"3. Running Install Mods (ISO or SSD)"))
             except Exception as e:
                 self.msg_queue.put(LogMsg(f"Export failed: {e}", "error"))
                 self.root.after(0, lambda: messagebox.showerror(
                     "Export Failed", str(e)))
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _start_import(self):
+        """Import a mod pack ZIP into the output folder."""
+        from tkinter import filedialog as fd
+
+        output_path = self.window.output_var.get().strip()
+        if not output_path:
+            messagebox.showwarning("Missing Input",
+                "Please select an output folder first.")
+            return
+        if not os.path.isdir(output_path):
+            messagebox.showerror("Invalid Folder",
+                f"Output folder does not exist:\n{output_path}")
+            return
+
+        zip_path = fd.askopenfilename(
+            title="Select Mod Pack ZIP",
+            filetypes=[("Zip files", "*.zip"), ("All files", "*.*")],
+        )
+        if not zip_path:
+            return  # User cancelled
+
+        proceed = messagebox.askyesno(
+            "Import Mod Pack",
+            f"This will extract the mod pack into:\n\n"
+            f"  {output_path}\n\n"
+            f"Existing files with the same names will be overwritten.\n\n"
+            f"Continue?")
+        if not proceed:
+            return
+
+        self.window.append_log("Importing mod pack...", "info")
+
+        def log_cb(text, level="info"):
+            self.msg_queue.put(LogMsg(text, level))
+
+        def progress_cb(current, total, desc=""):
+            self.msg_queue.put(ProgressMsg(current, total, desc))
+
+        def _run():
+            try:
+                num_files = import_mod_pack(
+                    zip_path, output_path,
+                    log_cb=log_cb, progress_cb=progress_cb,
+                )
+                self.msg_queue.put(LogMsg(
+                    f"Mod pack imported successfully ({num_files} file(s)).",
+                    "success"))
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Import Complete",
+                    f"Imported {num_files} file(s) from:\n"
+                    f"{os.path.basename(zip_path)}\n\n"
+                    f"Now use Build USB ISO or Write to SSD to\n"
+                    f"install these mods onto your machine."))
+            except Exception as e:
+                self.msg_queue.put(LogMsg(f"Import failed: {e}", "error"))
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Import Failed", str(e)))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _mod_cancel(self):
+        """Cancel the running mod pipeline."""
+        if self.pipeline:
+            self.window.append_log("Cancelling...", "error")
+            self.pipeline.cancel()
 
     # --- Common ---
 
