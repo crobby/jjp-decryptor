@@ -2657,16 +2657,22 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
 
         # Deploy crypto module to WSL /tmp
         self.log("Deploying Python crypto module to WSL...", "info")
-        pkg_dir = os.path.dirname(os.path.abspath(__file__))
         from .executor import DockerExecutor
         if isinstance(self.executor, DockerExecutor):
-            # Docker: copy on host side into cache dir (already mounted as /tmp)
-            import shutil
+            # Docker on macOS: write module source into cache dir (mounted
+            # as /tmp).  We read via inspect so it works even when PyInstaller
+            # bundles only .pyc files or uses symlinks we can't resolve.
+            import inspect
             cache_dir = self.executor._cache_dir()
-            for module in ("crypto.py", "filelist.py"):
-                shutil.copy2(os.path.join(pkg_dir, module),
-                             os.path.join(cache_dir, f"jjp_{module}"))
+            for mod_name in ("crypto", "filelist"):
+                mod = __import__(
+                    f"jjp_decryptor.{mod_name}", fromlist=[mod_name])
+                source = inspect.getsource(mod)
+                dst = os.path.join(cache_dir, f"jjp_{mod_name}.py")
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(source)
         else:
+            pkg_dir = os.path.dirname(os.path.abspath(__file__))
             for module in ("crypto.py", "filelist.py"):
                 src = self.executor.to_exec_path(os.path.join(pkg_dir, module))
                 self.executor.run(f"cp '{src}' /tmp/jjp_{module}", timeout=10)
