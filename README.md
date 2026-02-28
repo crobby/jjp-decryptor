@@ -9,6 +9,8 @@ JJP pinball machines store encrypted game assets (images, videos, audio, fonts) 
 1. **Decrypts** every asset in a game image using a fully reverse-engineered pure Python implementation of the game's custom PRNG and XOR cipher — no dongle or game binary needed
 2. **Re-encrypts** modified assets back into the game image with CRC32 forgery so the game's integrity checks pass without touching the file list
 3. **Produces a bootable Clonezilla ISO** ready to flash onto the machine via USB
+4. **Direct SSD mode** *(experimental)*: Plug the machine's SSD into your computer via a USB enclosure and decrypt/modify files in place — no ISO extraction or rebuilding needed
+5. **Export Mod Pack**: Package your modified files into a shareable zip that other users can apply to their own machines
 
 ## Supported Games
 
@@ -138,6 +140,51 @@ After decrypting, you can replace game assets and re-encrypt them:
 
 Detailed instructions: [Windows (PDF)](https://marketing.jerseyjackpinball.com/general/install-full/JJP_USB_UPDATE_PC_instructions.pdf) | [Mac (PDF)](https://marketing.jerseyjackpinball.com/general/install-full/JJP_USB_UPDATE_MAC_instructions.pdf)
 
+### Direct SSD Mode (Experimental)
+
+Instead of going through the ISO workflow, you can plug the machine's SATA SSD directly into your computer via a USB-to-SATA enclosure and decrypt or modify files in place. This eliminates the ~30-minute ISO extract/rebuild cycle.
+
+**What you need:**
+- A **USB-to-SATA enclosure** or adapter (the JJP SSD is a standard 2.5" SATA drive)
+- **Administrator privileges** (Windows requires admin for `wsl --mount`)
+
+**To decrypt from SSD:**
+1. Power off the pinball machine and remove the SSD
+2. Connect the SSD to your computer via the USB enclosure
+3. Switch to the **Direct SSD** tab
+4. Click **Refresh** to detect the drive, then select it from the dropdown
+5. Set the output folder on the Decrypt tab
+6. Click **Decrypt from SSD** — the drive is mounted read-only
+
+**To apply mods to SSD:**
+1. Decrypt the game first (from SSD or ISO) to get the output folder with `fl_decrypted.dat` and `.checksums.md5`
+2. Modify files in the output folder
+3. Connect the SSD via USB enclosure
+4. Click **Apply Mods to SSD** — the tool mounts read-write, encrypts changed files directly to the SSD, syncs, unmounts, and runs `e2fsck`
+5. Put the SSD back in the machine and power on — no USB flashing needed
+
+**Platform details:**
+- **Windows**: Uses `wsl --mount \\.\PHYSICALDRIVE<N> --partition 3 --type ext4`. Requires WSL2 and admin privileges.
+- **macOS**: Uses Docker with `--device` passthrough. Requires Docker Desktop.
+- **Linux**: Uses native `mount -t ext4`. Requires root.
+
+> **Note**: This feature is experimental. Always keep your original Clonezilla ISO as a backup. The tool validates that the SSD contains a JJP game partition before proceeding.
+
+### Exporting and Sharing Mod Packs
+
+After modifying files, you can package just the changed files into a shareable zip:
+
+1. Decrypt the game and modify files in the output folder
+2. Switch to the **Direct SSD** tab and click **Export Mod Pack**
+3. Choose a save location — the zip contains only modified files plus `fl_decrypted.dat` and `.checksums.md5`
+
+**To apply a mod pack you received:**
+1. Decrypt your own game first (from ISO or SSD) to create the output folder
+2. Extract the mod pack zip over the output folder (replacing files)
+3. Run **Apply Modifications** (ISO workflow) or **Apply Mods to SSD** (direct SSD)
+
+Mod packs are small (only changed files) and game-specific. They work across machines running the same game.
+
 ### File Format Notes
 
 - Images: **PNG** (same dimensions as originals)
@@ -182,7 +229,7 @@ jjp_decryptor/
 ├── cli.py           # CLI entry point for Docker/headless use (python -m jjp_decryptor.cli)
 ├── app.py           # Application controller — wires GUI ↔ pipeline via thread-safe queue
 ├── gui.py           # Tkinter GUI with dark/light theme, tabs, progress tracking
-├── pipeline.py      # StandaloneDecryptPipeline and StandaloneModPipeline
+├── pipeline.py      # Standalone, Direct SSD, and ISO pipelines + mod pack export
 ├── audio.py         # WAV format detection and pure Python audio conversion
 ├── crypto.py        # Pure Python PRNG, XOR cipher, filler detection, CRC32 forgery
 ├── filelist.py      # fl.dat parser/generator and filesystem scanner
@@ -231,6 +278,7 @@ This means `fl.dat` is restored byte-for-byte from its original encrypted form �
 
 ### End-to-End Flow
 
+**ISO Workflow** (traditional):
 ```mermaid
 flowchart LR
     subgraph Your PC
@@ -243,6 +291,21 @@ flowchart LR
     end
     MISO --> FLASH[Flash to USB]
     FLASH --> MACHINE[Pinball Machine]
+```
+
+**Direct SSD Workflow** (experimental — no ISO needed):
+```mermaid
+flowchart LR
+    subgraph Your PC
+        SSD1[SSD via USB] --> DEC2[SSD Decrypt]
+        DEC2 --> FILES2[Decrypted Assets]
+        FILES2 --> EDIT2[Edit files]
+        EDIT2 --> MOD2[SSD Modify]
+        SSD2[SSD via USB] --> MOD2
+    end
+    MOD2 --> SSD3[SSD back in machine]
+    EDIT2 --> EXP[Export Mod Pack]
+    EXP --> ZIP[Shareable .zip]
 ```
 
 ### Decrypt Pipeline
@@ -297,6 +360,44 @@ flowchart TD
 | **Convert** | Syncs and unmounts ext4 (with retry and verification that writes persisted), runs `e2fsck -fy`, converts to partclone format with `pigz --fast -b 1024 --rsyncable`, splits into ~1GB chunks matching the original layout |
 | **Build ISO** | Uses `xorriso` to splice the new partition chunks into the original ISO, preserving all boot records (MBR, El Torito, EFI, Syslinux) |
 | **Cleanup** | Unmounts everything, removes temp files and raw images |
+
+### Direct SSD Decrypt Pipeline
+
+```mermaid
+flowchart TD
+    A[Start] --> B[Mount]
+    B --> C[Decrypt]
+    C --> D[Cleanup]
+    D --> E[Done]
+
+    B -.- B1["wsl --mount / Docker --device / native mount\nPartition 3, ext4, read-only\nValidate /jjpe/gen1/ exists"]
+    C -.- C1["Same as ISO decrypt:\nScan filesystem, detect filler sizes\nXOR-decrypt each file to output folder"]
+    D -.- D1["Unmount SSD"]
+```
+
+### Direct SSD Modify Pipeline
+
+```mermaid
+flowchart TD
+    A[Start] --> B[Scan]
+    B --> C[Mount]
+    C --> D[Encrypt]
+    D --> E[Cleanup]
+    E --> F[Done]
+
+    B -.- B1["Compare output folder against .checksums.md5"]
+    C -.- C1["Mount SSD partition 3 read-write"]
+    D -.- D1["Same as ISO encrypt:\nAuto-convert audio, encrypt, forge CRC32\nWrite directly to SSD"]
+    E -.- E1["Sync → unmount → e2fsck -fy"]
+```
+
+| Phase | What Happens |
+|-------|-------------|
+| **Mount** | Platform-aware mount of SSD partition 3 (ext4). Read-only for decrypt, read-write for modify. Validates `/jjpe/gen1/` exists |
+| **Decrypt** | Identical to ISO decrypt — scans, detects fillers, XOR-decrypts to output folder |
+| **Scan** | Same checksum comparison as ISO modify — finds changed files |
+| **Encrypt** | Same pure Python encryption with CRC32 forgery — writes encrypted files directly to the SSD |
+| **Cleanup** | Syncs filesystem, unmounts SSD, runs `e2fsck -fy` (modify only) |
 
 ## Troubleshooting
 
