@@ -3619,18 +3619,17 @@ class StandaloneModPipeline(ModPipeline):
             mp = self.mount_point
             wsl_img = self._raw_img_path
 
-            # ---- Flush + remount-ro to commit ext4 journal ----
+            # ---- Flush ext4 journal before unmount ----
             # WSL2 lazy unmount can lose writes if the ext4 journal hasn't
-            # committed.  Remounting read-only forces the journal to flush
-            # all pending data and metadata to the backing loop image,
-            # making the filesystem clean BEFORE we attempt to detach.
+            # committed.  We try multiple approaches with generous timeouts
+            # (32 GB images on slow I/O can take minutes to sync).
             self.log("Syncing filesystem before unmount...", "info")
             try:
-                self.executor.run(f"sync -f '{mp}/'", timeout=60)
+                self.executor.run(f"sync -f '{mp}/'", timeout=120)
             except CommandError:
                 pass
             try:
-                self.executor.run("sync", timeout=30)
+                self.executor.run("sync", timeout=120)
             except CommandError:
                 pass
 
@@ -3644,7 +3643,7 @@ class StandaloneModPipeline(ModPipeline):
             # 1) fsfreeze: freeze flushes everything, then thaw to allow unmount
             try:
                 self.executor.run(
-                    f"fsfreeze --freeze '{mp}'", timeout=60)
+                    f"fsfreeze --freeze '{mp}'", timeout=180)
                 self.executor.run(
                     f"fsfreeze --unfreeze '{mp}'", timeout=60)
                 journal_flushed = True
@@ -3657,7 +3656,7 @@ class StandaloneModPipeline(ModPipeline):
             if not journal_flushed:
                 try:
                     self.executor.run(
-                        f"mount -o remount,ro '{mp}'", timeout=60)
+                        f"mount -o remount,ro '{mp}'", timeout=180)
                     journal_flushed = True
                     self.log("  Remounted read-only (journal flushed).",
                              "info")
@@ -3671,7 +3670,7 @@ class StandaloneModPipeline(ModPipeline):
                 try:
                     self.executor.run(
                         "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; "
-                        "true", timeout=10)
+                        "true", timeout=30)
                 except CommandError:
                     pass
                 try:
@@ -3682,7 +3681,7 @@ class StandaloneModPipeline(ModPipeline):
                     if loop_dev:
                         self.executor.run(
                             f"blockdev --flushbufs '{loop_dev}' "
-                            f"2>/dev/null; true", timeout=10)
+                            f"2>/dev/null; true", timeout=30)
                 except CommandError:
                     pass
 
@@ -3692,7 +3691,7 @@ class StandaloneModPipeline(ModPipeline):
             for attempt in range(5):
                 try:
                     self.executor.run(
-                        f"umount '{mp}'", timeout=30)
+                        f"umount '{mp}'", timeout=60)
                     unmounted = True
                     break
                 except CommandError:
@@ -3711,7 +3710,7 @@ class StandaloneModPipeline(ModPipeline):
                                 pass
                         try:
                             self.executor.run(
-                                "sync; sleep 2; sync", timeout=20)
+                                "sync; sleep 2; sync", timeout=60)
                         except CommandError:
                             pass
 
@@ -3727,7 +3726,7 @@ class StandaloneModPipeline(ModPipeline):
                         timeout=30)
                 except CommandError:
                     pass
-                # Detach loop device
+                # Detach loop device to force writeback
                 try:
                     loop_dev = self.executor.run(
                         f"losetup -j '{wsl_img}' 2>/dev/null | head -1 | "
@@ -3735,10 +3734,13 @@ class StandaloneModPipeline(ModPipeline):
                     if loop_dev:
                         self.executor.run(
                             f"losetup -d '{loop_dev}' 2>/dev/null; true",
-                            timeout=30)
+                            timeout=60)
                 except CommandError:
                     pass
-                self.executor.run("sync; sleep 2", timeout=15)
+                try:
+                    self.executor.run("sync", timeout=120)
+                except CommandError:
+                    pass
 
             try:
                 self.executor.run(
