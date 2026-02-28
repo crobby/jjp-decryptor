@@ -2998,8 +2998,10 @@ class StandaloneModPipeline(ModPipeline):
 
         try:
             self.executor.run(f"mkdir -p {self.mount_point}", timeout=10)
+            # sync: every write goes directly to the backing file, so
+            # data persists even if clean unmount fails on WSL2.
             self.executor.run(
-                f"mount -o loop,rw '{wsl_img}' {self.mount_point}",
+                f"mount -o loop,rw,sync '{wsl_img}' {self.mount_point}",
                 timeout=config.MOUNT_TIMEOUT,
             )
             self.log(f"Mounted at {self.mount_point}", "success")
@@ -3685,6 +3687,28 @@ class StandaloneModPipeline(ModPipeline):
                         self.executor.run(
                             f"blockdev --flushbufs '{loop_dev}' "
                             f"2>/dev/null; true", timeout=30)
+                except CommandError:
+                    pass
+
+            # 4) Two-level flush: explicitly fdatasync the backing file.
+            # Loop-mounted ext4 has two cache layers:
+            #   inner ext4 → loop device page cache → backing file
+            # The sync above flushes inner ext4 to the loop device,
+            # but the loop device's pages may not be flushed to the
+            # backing file on the outer filesystem. fdatasync forces it.
+            try:
+                self.executor.run(
+                    f"python3 -c \""
+                    f"import os; fd=os.open('{wsl_img}', os.O_RDWR); "
+                    f"os.fdatasync(fd); os.close(fd)\"",
+                    timeout=180)
+                self.log("  Backing file synced (fdatasync).", "info")
+            except CommandError:
+                # Fall back to sync -f on the backing file
+                try:
+                    self.executor.run(
+                        f"sync -f '{wsl_img}'", timeout=120)
+                    self.log("  Backing file synced (sync -f).", "info")
                 except CommandError:
                     pass
 
