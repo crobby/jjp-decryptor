@@ -33,24 +33,21 @@ def _find_project_file(filename):
     return candidate  # fall back to original (will fail with clear error)
 
 
-def _project_dirs():
-    """Return directories that contain project files.
+def _stage_project_file(filename, cache_dir):
+    """Copy a project file into the Docker cache directory.
 
-    For source installs this is just the directory containing jjp_decryptor/.
-    For macOS .app bundles, both Contents/Frameworks/ (Python code) and
-    Contents/Resources/ (--add-data files like partclone_to_raw.py) are needed.
-    Uses realpath() so Docker bind-mounts use resolved paths.
+    Docker Desktop on macOS only shares certain host directories by default
+    (e.g. /Users, /tmp).  The .app bundle lives in /Applications which is
+    NOT shared, so bind-mounting it fails.  Instead, copy the file into the
+    cache dir that is already mounted as /tmp inside the container.
+    Returns the container-side path (/tmp/<filename>).
     """
-    pkg_dir = os.path.dirname(os.path.realpath(__file__))
-    parent = os.path.dirname(pkg_dir)
-    dirs = [parent]
-    # macOS .app bundle: Resources/ is a sibling of Frameworks/
-    resources = os.path.join(pkg_dir, "..", "Resources")
-    if os.path.isdir(resources):
-        resources = os.path.realpath(resources)
-        if resources != parent:
-            dirs.append(resources)
-    return dirs
+    import shutil
+    src = _find_project_file(filename)
+    if os.path.isfile(src):
+        dst = os.path.join(cache_dir, filename)
+        shutil.copy2(src, dst)
+    return f"/tmp/{filename}"
 
 
 # Python script deployed to WSL for standalone decryption.
@@ -596,10 +593,14 @@ class DecryptionPipeline:
     def _extract_with_python(self, parts, script_path=None):
         """Use the proven Python partclone converter."""
         self.log("Using Python partclone converter...", "info")
-        if script_path is None:
-            script_path = _find_project_file("partclone_to_raw.py")
-
-        wsl_script = self.executor.to_exec_path(script_path)
+        # Docker: use the pre-staged copy in /tmp (avoids /Applications mount)
+        from .executor import DockerExecutor
+        if isinstance(self.executor, DockerExecutor) and hasattr(self, '_docker_partclone_path'):
+            wsl_script = self._docker_partclone_path
+        else:
+            if script_path is None:
+                script_path = _find_project_file("partclone_to_raw.py")
+            wsl_script = self.executor.to_exec_path(script_path)
         parts_str = " ".join(f"'{p}'" for p in parts)
         cmd = f"PYTHONUNBUFFERED=1 python3 '{wsl_script}' '{self._raw_img_path}' {parts_str} 2>&1"
 
@@ -2574,8 +2575,11 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
             # Start Docker container if on macOS
             if isinstance(self.executor, DockerExecutor):
                 self.log("Starting Docker container...", "info")
+                cache_dir = self.executor._cache_dir()
+                self._docker_partclone_path = _stage_project_file(
+                    "partclone_to_raw.py", cache_dir)
                 self.executor.start_container([
-                    self.image_path, self.output_path, *_project_dirs()])
+                    self.image_path, self.output_path])
 
             self.on_phase(0)  # Extract
             self._phase_extract()
@@ -2848,8 +2852,11 @@ class StandaloneModPipeline(ModPipeline):
             # Start Docker container if on macOS
             if isinstance(self.executor, DockerExecutor):
                 self.log("Starting Docker container...", "info")
+                cache_dir = self.executor._cache_dir()
+                self._docker_partclone_path = _stage_project_file(
+                    "partclone_to_raw.py", cache_dir)
                 self.executor.start_container([
-                    self.image_path, self.assets_folder, *_project_dirs()])
+                    self.image_path, self.assets_folder])
 
             self.on_phase(0)  # Scan
             self._phase_scan()
