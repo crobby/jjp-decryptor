@@ -11,6 +11,7 @@ from . import __version__
 from .gui import MainWindow
 from .pipeline import (DecryptionPipeline, ModPipeline,
                         StandaloneDecryptPipeline, StandaloneModPipeline,
+                        DirectSSDDecryptPipeline, DirectSSDModPipeline,
                         check_prerequisites)
 from .updater import check_for_update
 from .executor import create_executor
@@ -90,6 +91,10 @@ class App:
             on_theme_change=self._on_theme_change,
             initial_theme=saved_theme,
             on_install_prereqs=self._install_prereqs,
+            on_ssd_decrypt=self._ssd_decrypt,
+            on_ssd_modify=self._ssd_modify,
+            on_ssd_cancel=self._ssd_cancel,
+            on_ssd_refresh=self._ssd_refresh,
         )
 
         # Detect game name when file is selected (register before loading settings
@@ -196,6 +201,8 @@ class App:
                         "modify": config.MOD_PHASES,
                         "decrypt_standalone": config.STANDALONE_PHASES,
                         "modify_standalone": config.STANDALONE_MOD_PHASES,
+                        "ssd_decrypt": config.DIRECT_SSD_PHASES,
+                        "ssd_modify": config.DIRECT_SSD_MOD_PHASES,
                     }
                     phases = phase_map.get(self._active_mode, config.PHASES)
                     if msg.index < len(phases):
@@ -518,13 +525,178 @@ class App:
             self.window.append_log("Cancelling...", "error")
             self.pipeline.cancel()
 
+    # --- Direct SSD pipeline ---
+
+    def _ssd_refresh(self):
+        """Callback after GUI refreshes device list (placeholder for future use)."""
+        pass
+
+    def _ssd_decrypt(self):
+        """Start the direct SSD decryption pipeline."""
+        device = self.window.get_ssd_device()
+        output_path = self.window.output_var.get().strip()
+
+        if device is None:
+            messagebox.showwarning("No Device",
+                "Please select a drive from the device list.\n\n"
+                "Connect the JJP SSD via a USB enclosure, then click Refresh.")
+            return
+        if not output_path:
+            messagebox.showwarning("Missing Input",
+                "Please select an output folder on the Decrypt tab first.")
+            return
+
+        # Warn if output folder already has decrypted content
+        if os.path.isdir(output_path) and os.listdir(output_path):
+            proceed = messagebox.askyesno(
+                "Output Folder Not Empty",
+                "The output folder already contains files.\n\n"
+                "Decrypting again will overwrite any existing files "
+                "(including files you may have modified).\n\n"
+                "Continue?")
+            if not proceed:
+                return
+
+        # Confirm device selection
+        proceed = messagebox.askyesno(
+            "Confirm Device",
+            f"You are about to read from:\n\n"
+            f"  {device}\n\n"
+            f"This will mount the drive read-only to decrypt game assets.\n\n"
+            f"Continue?")
+        if not proceed:
+            return
+
+        self._save_settings()
+
+        fl_dat_path = self._find_fl_dat()
+
+        self._active_mode = "ssd_decrypt"
+        self.window.set_running(True, mode=self._active_mode)
+        self.window.reset_steps(mode=self._active_mode)
+
+        def log_cb(text, level="info"):
+            self.msg_queue.put(LogMsg(text, level))
+
+        def phase_cb(index):
+            self.msg_queue.put(PhaseMsg(index))
+
+        def progress_cb(current, total, desc=""):
+            self.msg_queue.put(ProgressMsg(current, total, desc))
+
+        def done_cb(success, summary):
+            self.msg_queue.put(DoneMsg(success, summary))
+
+        if fl_dat_path:
+            log_cb(f"Using cached file list: {fl_dat_path}", "success")
+        else:
+            log_cb("No cached file list found. Will scan filesystem "
+                   "and auto-detect filler sizes.", "info")
+        log_cb("Direct SSD mode — no ISO extraction needed.", "success")
+
+        self.pipeline = DirectSSDDecryptPipeline(
+            device.device_id, output_path, fl_dat_path,
+            log_cb, phase_cb, progress_cb, done_cb,
+        )
+        # Intercept game detection
+        orig_detect = self.pipeline._detect_game
+        def patched_detect():
+            orig_detect()
+            if self.pipeline.game_name:
+                self.msg_queue.put(GameDetectedMsg(self.pipeline.game_name))
+        self.pipeline._detect_game = patched_detect
+
+        threading.Thread(target=self.pipeline.run, daemon=True).start()
+
+    def _ssd_modify(self):
+        """Start the direct SSD modification pipeline."""
+        device = self.window.get_ssd_device()
+        output_path = self.window.output_var.get().strip()
+
+        if device is None:
+            messagebox.showwarning("No Device",
+                "Please select a drive from the device list.\n\n"
+                "Connect the JJP SSD via a USB enclosure, then click Refresh.")
+            return
+        if not output_path:
+            messagebox.showwarning("Missing Input",
+                "Please select an output folder (containing your modified assets) "
+                "on the Decrypt tab first.")
+            return
+        if not os.path.isdir(output_path):
+            messagebox.showerror("Invalid Folder",
+                f"Output folder does not exist:\n{output_path}")
+            return
+
+        checksums_file = os.path.join(output_path, '.checksums.md5')
+        if not os.path.isfile(checksums_file):
+            messagebox.showerror("No Baseline Checksums",
+                "No .checksums.md5 file found in the output folder.\n\n"
+                "Run Decrypt first to generate baseline checksums, then "
+                "modify files in the output folder and try again.")
+            return
+
+        fl_dat_path = self._find_fl_dat()
+        if not fl_dat_path:
+            messagebox.showerror(
+                "Missing File List",
+                "No fl_decrypted.dat found in the output folder.\n\n"
+                "Run Decrypt first to generate the file list, then try "
+                "Modify again.")
+            return
+
+        # Confirm device selection — this modifies a physical drive
+        proceed = messagebox.askyesno(
+            "Confirm Direct SSD Modification",
+            f"WARNING: You are about to modify files directly on:\n\n"
+            f"  {device}\n\n"
+            f"This writes encrypted files directly to the SSD.\n"
+            f"Make sure you have a backup (original Clonezilla ISO).\n\n"
+            f"This cannot be undone. Continue?")
+        if not proceed:
+            return
+
+        self._save_settings()
+
+        self._active_mode = "ssd_modify"
+        self.window.set_running(True, mode=self._active_mode)
+        self.window.reset_steps(mode=self._active_mode)
+
+        def log_cb(text, level="info"):
+            self.msg_queue.put(LogMsg(text, level))
+
+        def phase_cb(index):
+            self.msg_queue.put(PhaseMsg(index))
+
+        def progress_cb(current, total, desc=""):
+            self.msg_queue.put(ProgressMsg(current, total, desc))
+
+        def done_cb(success, summary):
+            self.msg_queue.put(DoneMsg(success, summary))
+
+        log_cb(f"Using cached file list: {fl_dat_path}", "success")
+        log_cb("Direct SSD mod mode — writing directly to drive.", "info")
+
+        self.pipeline = DirectSSDModPipeline(
+            device.device_id, output_path, fl_dat_path,
+            log_cb, phase_cb, progress_cb, done_cb,
+        )
+        self.pipeline.log_link = lambda text, url: self.msg_queue.put(LinkMsg(text, url))
+        threading.Thread(target=self.pipeline.run, daemon=True).start()
+
+    def _ssd_cancel(self):
+        """Cancel the running SSD pipeline."""
+        if self.pipeline:
+            self.window.append_log("Cancelling...", "error")
+            self.pipeline.cancel()
+
     # --- Common ---
 
     def _on_done(self, success, summary):
         """Handle pipeline completion."""
         mode = self._active_mode
         self.window.set_running(False, mode=mode)
-        is_decrypt = mode in ("decrypt", "decrypt_standalone")
+        is_decrypt = mode in ("decrypt", "decrypt_standalone", "ssd_decrypt")
         if success:
             self.window.set_status("Complete!")
             title = "Decryption Complete" if is_decrypt else "Modification Complete"

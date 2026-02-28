@@ -519,3 +519,207 @@ def create_executor():
     else:
         # Linux and other Unix-like
         return NativeExecutor()
+
+
+# ------------------------------------------------------------------
+# Device detection for Direct SSD mode
+# ------------------------------------------------------------------
+
+class DiskInfo:
+    """Information about a detected disk device."""
+    def __init__(self, device_id, model, size_bytes, size_display):
+        self.device_id = device_id      # e.g. \\.\PHYSICALDRIVE2 or /dev/sdb
+        self.model = model              # e.g. "Samsung SSD 860"
+        self.size_bytes = size_bytes     # raw size in bytes
+        self.size_display = size_display  # e.g. "120 GB"
+
+    def __str__(self):
+        return f"{self.model} ({self.size_display}) — {self.device_id}"
+
+
+def _format_size(size_bytes):
+    """Format byte count as human-readable string."""
+    if size_bytes >= 1024**4:
+        return f"{size_bytes / 1024**4:.1f} TB"
+    if size_bytes >= 1024**3:
+        return f"{size_bytes / 1024**3:.1f} GB"
+    if size_bytes >= 1024**2:
+        return f"{size_bytes / 1024**2:.0f} MB"
+    return f"{size_bytes / 1024:.0f} KB"
+
+
+def list_disk_devices():
+    """Detect available disk devices on the current platform.
+
+    Returns a list of DiskInfo objects for non-system physical disks.
+    Filters out the Windows boot disk and very small devices.
+    """
+    if sys.platform == "win32":
+        return _list_disks_windows()
+    elif sys.platform == "darwin":
+        return _list_disks_macos()
+    else:
+        return _list_disks_linux()
+
+
+def _list_disks_windows():
+    """List physical disks on Windows via PowerShell WMI query."""
+    disks = []
+    try:
+        # Get all physical drives (excluding the boot drive)
+        ps_cmd = (
+            'Get-CimInstance -Query "SELECT DeviceID, Model, Size, Index '
+            'FROM Win32_DiskDrive" | '
+            'ForEach-Object { "$($_.DeviceID)|$($_.Model)|$($_.Size)|$($_.Index)" }'
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=15,
+            creationflags=_CREATE_FLAGS,
+        )
+        if result.returncode != 0:
+            return disks
+
+        # Find the boot disk index so we can exclude it
+        boot_cmd = (
+            'Get-CimInstance -Query "SELECT DiskIndex FROM Win32_DiskPartition '
+            'WHERE BootPartition = TRUE" | '
+            'ForEach-Object { $_.DiskIndex }'
+        )
+        boot_result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", boot_cmd],
+            capture_output=True, text=True, timeout=10,
+            creationflags=_CREATE_FLAGS,
+        )
+        boot_indexes = set()
+        if boot_result.returncode == 0:
+            for line in boot_result.stdout.strip().splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    boot_indexes.add(int(line))
+
+        for line in result.stdout.strip().splitlines():
+            line = line.strip()
+            if not line or "|" not in line:
+                continue
+            parts = line.split("|")
+            if len(parts) < 4:
+                continue
+            device_id, model, size_str, index_str = parts[0], parts[1], parts[2], parts[3]
+            try:
+                size = int(size_str)
+                index = int(index_str)
+            except (ValueError, TypeError):
+                continue
+
+            # Skip boot disk and very small devices (< 1 GB)
+            if index in boot_indexes:
+                continue
+            if size < 1024**3:
+                continue
+
+            disks.append(DiskInfo(
+                device_id=device_id.strip(),
+                model=model.strip(),
+                size_bytes=size,
+                size_display=_format_size(size),
+            ))
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return disks
+
+
+def _list_disks_macos():
+    """List physical disks on macOS via diskutil."""
+    disks = []
+    try:
+        result = subprocess.run(
+            ["diskutil", "list", "-plist", "physical"],
+            capture_output=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return disks
+
+        # Parse plist output to get disk identifiers
+        import plistlib
+        plist = plistlib.loads(result.stdout)
+        all_disks = plist.get("AllDisksAndPartitions", [])
+
+        for disk_entry in all_disks:
+            disk_id = disk_entry.get("DeviceIdentifier", "")
+            if not disk_id:
+                continue
+            device_path = f"/dev/{disk_id}"
+            size = disk_entry.get("Size", 0)
+
+            # Get model info
+            info_result = subprocess.run(
+                ["diskutil", "info", "-plist", disk_id],
+                capture_output=True, timeout=10,
+            )
+            model = "Unknown"
+            if info_result.returncode == 0:
+                info = plistlib.loads(info_result.stdout)
+                model = info.get("MediaName", "Unknown")
+                if not size:
+                    size = info.get("TotalSize", 0)
+                # Skip internal/boot disk
+                if info.get("Internal", False):
+                    continue
+
+            if size < 1024**3:
+                continue
+
+            disks.append(DiskInfo(
+                device_id=device_path,
+                model=model,
+                size_bytes=size,
+                size_display=_format_size(size),
+            ))
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return disks
+
+
+def _list_disks_linux():
+    """List physical disks on Linux via lsblk."""
+    disks = []
+    try:
+        result = subprocess.run(
+            ["lsblk", "-d", "-b", "-n", "-o", "NAME,SIZE,MODEL,RM,TYPE"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return disks
+
+        for line in result.stdout.strip().splitlines():
+            parts = line.split(None, 4)
+            if len(parts) < 4:
+                continue
+            name = parts[0]
+            try:
+                size = int(parts[1])
+            except ValueError:
+                continue
+            model = parts[2] if len(parts) > 2 else "Unknown"
+            removable = parts[3] if len(parts) > 3 else "0"
+            dev_type = parts[4].strip() if len(parts) > 4 else "disk"
+
+            # Only show disks (not partitions), skip very small
+            if dev_type != "disk":
+                continue
+            if size < 1024**3:
+                continue
+
+            # Prefer removable/USB devices but show all non-boot
+            device_path = f"/dev/{name}"
+
+            disks.append(DiskInfo(
+                device_id=device_path,
+                model=model.strip(),
+                size_bytes=size,
+                size_display=_format_size(size),
+            ))
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return disks

@@ -96,12 +96,14 @@ class _Tooltip:
 
 
 class MainWindow:
-    """Single-window tkinter GUI with Decrypt and Modify tabs."""
+    """Single-window tkinter GUI with Decrypt, Modify, and Direct SSD tabs."""
 
     def __init__(self, root, on_check_prereqs, on_start, on_cancel,
                  on_mod_apply=None, on_mod_cancel=None, on_clear_cache=None,
                  on_theme_change=None, initial_theme=None,
-                 on_install_prereqs=None):
+                 on_install_prereqs=None,
+                 on_ssd_decrypt=None, on_ssd_modify=None,
+                 on_ssd_cancel=None, on_ssd_refresh=None):
         self.root = root
         self._on_check_prereqs = on_check_prereqs
         self._on_start = on_start
@@ -111,6 +113,10 @@ class MainWindow:
         self._on_clear_cache = on_clear_cache
         self._on_theme_change = on_theme_change
         self._on_install_prereqs = on_install_prereqs
+        self._on_ssd_decrypt = on_ssd_decrypt
+        self._on_ssd_modify = on_ssd_modify
+        self._on_ssd_cancel = on_ssd_cancel
+        self._on_ssd_refresh = on_ssd_refresh
 
         # Title is set by App (includes version); fallback here for standalone use
         if not root.title():
@@ -278,6 +284,11 @@ class MainWindow:
                 label.configure(
                     foreground=c["success"] if passed else c["error"])
 
+        # Redraw SSD diagram with new colors
+        self._draw_ssd_diagram()
+        # Update SSD warning color
+        self.ssd_warning.configure(foreground=c["error"])
+
         # Theme toggle button: yellow sun / blue moon
         if theme == "dark":
             self.theme_btn.configure(text="\u2600", style="Sun.TButton")
@@ -332,6 +343,10 @@ class MainWindow:
         mod_frame = ttk.Frame(self.notebook, padding=6)
         self.notebook.add(mod_frame, text=" Modify Assets ")
         self._build_mod_tab(mod_frame)
+
+        ssd_frame = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(ssd_frame, text=" Direct SSD ")
+        self._build_ssd_tab(ssd_frame)
 
         self._build_log(main)
 
@@ -453,6 +468,149 @@ class MainWindow:
         self.mod_cancel_btn = ttk.Button(btn_row, text="Cancel",
                                           command=self._on_mod_cancel, state=tk.DISABLED)
         self.mod_cancel_btn.pack(side=tk.LEFT, padx=4)
+
+    def _build_ssd_tab(self, parent):
+        c = _THEMES[self._current_theme]
+
+        # --- Workflow comparison diagram ---
+        diagram_frame = ttk.LabelFrame(parent, text=" How It Works ", padding=6)
+        diagram_frame.pack(fill=tk.X, pady=(0, 6))
+
+        self.ssd_diagram = tk.Canvas(diagram_frame, height=90,
+                                      highlightthickness=0)
+        self.ssd_diagram.pack(fill=tk.X)
+        self._draw_ssd_diagram()
+
+        # --- Warning banner ---
+        warn_frame = ttk.Frame(parent)
+        warn_frame.pack(fill=tk.X, pady=(0, 6))
+        self.ssd_warning = ttk.Label(
+            warn_frame,
+            text=("\u26A0  Remove the SSD from the pinball machine before "
+                  "connecting. Always keep the original ISO as a backup."),
+            foreground=c["error"], wraplength=700, justify=tk.LEFT)
+        self.ssd_warning.pack(anchor=tk.W)
+
+        # --- Device selector ---
+        dev_frame = ttk.Frame(parent)
+        dev_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(dev_frame, text="Game SSD:", width=14, anchor=tk.W).pack(side=tk.LEFT)
+        self.ssd_device_var = tk.StringVar()
+        self.ssd_device_combo = ttk.Combobox(
+            dev_frame, textvariable=self.ssd_device_var,
+            state="readonly", width=50)
+        self.ssd_device_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        ttk.Button(dev_frame, text="Refresh",
+                   command=self._ssd_refresh_devices, width=8).pack(side=tk.LEFT)
+
+        # --- Output / Assets folder (shared with main config) ---
+        folder_frame = ttk.Frame(parent)
+        folder_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(folder_frame, text="Output Folder:", width=14,
+                  anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Label(folder_frame, text="(uses the Output Folder from Configuration above)",
+                  foreground="gray").pack(side=tk.LEFT)
+
+        # --- Step indicators for SSD operations ---
+        self._ssd_step_row = ttk.Frame(parent)
+        self._ssd_step_row.pack(fill=tk.X, pady=(0, 6))
+        self.ssd_step_labels = []
+        self._build_step_labels(self._ssd_step_row, config.DIRECT_SSD_PHASES,
+                                self.ssd_step_labels)
+
+        # --- Progress bar ---
+        prog_row = ttk.Frame(parent)
+        prog_row.pack(fill=tk.X, pady=(0, 6))
+        self.ssd_progress_label = ttk.Label(prog_row, text="", anchor=tk.E)
+        self.ssd_progress_label.pack(side=tk.RIGHT)
+        self.ssd_progress = ttk.Progressbar(prog_row, mode="determinate")
+        self.ssd_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+
+        # --- Action buttons ---
+        btn_row = ttk.Frame(parent)
+        btn_row.pack()
+        self.ssd_decrypt_btn = ttk.Button(
+            btn_row, text="Decrypt from SSD",
+            command=self._on_ssd_decrypt)
+        self.ssd_decrypt_btn.pack(side=tk.LEFT, padx=4)
+        self.ssd_modify_btn = ttk.Button(
+            btn_row, text="Apply Mods to SSD",
+            command=self._on_ssd_modify)
+        self.ssd_modify_btn.pack(side=tk.LEFT, padx=4)
+        self.ssd_cancel_btn = ttk.Button(
+            btn_row, text="Cancel",
+            command=self._on_ssd_cancel, state=tk.DISABLED)
+        self.ssd_cancel_btn.pack(side=tk.LEFT, padx=4)
+
+        # Store device list for mapping combo index -> DiskInfo
+        self._ssd_devices = []
+
+    def _draw_ssd_diagram(self):
+        """Draw the workflow comparison diagram on the SSD tab's canvas."""
+        canvas = self.ssd_diagram
+        canvas.delete("all")
+        c = _THEMES[self._current_theme]
+        w = canvas.winfo_width() or 700
+        canvas.configure(bg=c["bg"])
+
+        # Row 1: ISO workflow
+        y1 = 22
+        canvas.create_text(10, y1, text="USB Drive:", anchor=tk.W,
+                          fill=c["gray"], font=(_SANS_FONT, 9))
+        x = 100
+        for i, label in enumerate(["ISO File", "Tool", "USB Drive", "Machine"]):
+            color = c["fg"] if i != 1 else c["accent"]
+            canvas.create_rectangle(x, y1-12, x+90, y1+12,
+                                   outline=c["border"], fill=c["button"])
+            canvas.create_text(x+45, y1, text=label, fill=color,
+                             font=(_SANS_FONT, 9))
+            if i < 3:
+                canvas.create_text(x+100, y1, text="\u2192",
+                                 fill=c["gray"], font=(_SANS_FONT, 12))
+            x += 110
+
+        # Row 2: Direct SSD workflow
+        y2 = 62
+        canvas.create_text(10, y2, text="Direct SSD:", anchor=tk.W,
+                          fill=c["success"], font=(_SANS_FONT, 9, "bold"))
+        x = 100
+        for i, label in enumerate(["SSD", "USB Adapter", "Tool", "SSD Back"]):
+            color = c["success"] if i == 2 else c["fg"]
+            canvas.create_rectangle(x, y2-12, x+90, y2+12,
+                                   outline=c["border"], fill=c["button"])
+            canvas.create_text(x+45, y2, text=label, fill=color,
+                             font=(_SANS_FONT, 9))
+            if i < 3:
+                arrow = "\u2192" if i < 2 else "\u2192"
+                canvas.create_text(x+100, y2, text=arrow,
+                                 fill=c["gray"], font=(_SANS_FONT, 12))
+            x += 110
+
+    def _ssd_refresh_devices(self):
+        """Refresh the device dropdown with detected disks."""
+        from .executor import list_disk_devices
+        self._ssd_devices = list_disk_devices()
+        values = [str(d) for d in self._ssd_devices]
+        if not values:
+            values = ["(no drives detected — connect SSD and click Refresh)"]
+            self._ssd_devices = []
+        self.ssd_device_combo.configure(values=values)
+        if values:
+            self.ssd_device_combo.current(0)
+        if self._on_ssd_refresh:
+            self._on_ssd_refresh()
+
+    def get_ssd_device(self):
+        """Return the selected DiskInfo, or None if nothing valid selected."""
+        idx = self.ssd_device_combo.current()
+        if 0 <= idx < len(self._ssd_devices):
+            return self._ssd_devices[idx]
+        return None
+
+    def set_ssd_phases(self, phases):
+        """Update the SSD step labels for a new set of phases."""
+        self._build_step_labels(self._ssd_step_row, phases,
+                                self.ssd_step_labels)
 
     def _build_log(self, parent):
         log_frame = ttk.LabelFrame(parent, text=" Log Output ", padding=4)
@@ -577,6 +735,8 @@ class MainWindow:
         """Return the appropriate step labels list for a mode."""
         if mode in ("decrypt", "decrypt_standalone"):
             return self.step_labels
+        if mode in ("ssd_decrypt", "ssd_modify"):
+            return self.ssd_step_labels
         return self.mod_step_labels
 
     def set_phase(self, phase_index, mode="decrypt"):
@@ -596,6 +756,10 @@ class MainWindow:
             self.progress.configure(mode="indeterminate")
             self.progress.start(15)
             self.progress_label.configure(text="")
+        elif mode in ("ssd_decrypt", "ssd_modify"):
+            self.ssd_progress.configure(mode="indeterminate")
+            self.ssd_progress.start(15)
+            self.ssd_progress_label.configure(text="")
         else:
             self.mod_progress.configure(mode="indeterminate")
             self.mod_progress.start(15)
@@ -606,6 +770,9 @@ class MainWindow:
         if mode in ("decrypt", "decrypt_standalone"):
             bar = self.progress
             label = self.progress_label
+        elif mode in ("ssd_decrypt", "ssd_modify"):
+            bar = self.ssd_progress
+            label = self.ssd_progress_label
         else:
             bar = self.mod_progress
             label = self.mod_progress_label
@@ -634,8 +801,12 @@ class MainWindow:
             self.check_btn.configure(state=tk.DISABLED)
             self.start_btn.configure(state=tk.DISABLED)
             self.mod_apply_btn.configure(state=tk.DISABLED)
+            self.ssd_decrypt_btn.configure(state=tk.DISABLED)
+            self.ssd_modify_btn.configure(state=tk.DISABLED)
             if mode in ("decrypt", "decrypt_standalone"):
                 self.cancel_btn.configure(state=tk.NORMAL)
+            elif mode in ("ssd_decrypt", "ssd_modify"):
+                self.ssd_cancel_btn.configure(state=tk.NORMAL)
             else:
                 self.mod_cancel_btn.configure(state=tk.NORMAL)
             self._start_time = time.time()
@@ -648,6 +819,9 @@ class MainWindow:
             self.cancel_btn.configure(state=tk.DISABLED)
             self.mod_apply_btn.configure(state=tk.NORMAL)
             self.mod_cancel_btn.configure(state=tk.DISABLED)
+            self.ssd_decrypt_btn.configure(state=tk.NORMAL)
+            self.ssd_modify_btn.configure(state=tk.NORMAL)
+            self.ssd_cancel_btn.configure(state=tk.DISABLED)
             # Stop any indeterminate animation and fill to 100%
             self.progress.stop()
             self.progress.configure(mode="determinate", maximum=100, value=100)
@@ -655,6 +829,9 @@ class MainWindow:
             self.mod_progress.stop()
             self.mod_progress.configure(mode="determinate", maximum=100, value=100)
             self.mod_progress_label.configure(text="100%")
+            self.ssd_progress.stop()
+            self.ssd_progress.configure(mode="determinate", maximum=100, value=100)
+            self.ssd_progress_label.configure(text="100%")
             self._start_time = None
             if self._timer_id:
                 self.root.after_cancel(self._timer_id)
@@ -675,6 +852,8 @@ class MainWindow:
             "modify": config.MOD_PHASES,
             "decrypt_standalone": config.STANDALONE_PHASES,
             "modify_standalone": config.STANDALONE_MOD_PHASES,
+            "ssd_decrypt": config.DIRECT_SSD_PHASES,
+            "ssd_modify": config.DIRECT_SSD_MOD_PHASES,
         }
         phases = phase_map.get(mode, config.PHASES)
 
@@ -687,6 +866,14 @@ class MainWindow:
             self.progress.stop()
             self.progress.configure(mode="determinate", value=0, maximum=100)
             self.progress_label.configure(text="")
+        elif mode in ("ssd_decrypt", "ssd_modify"):
+            if len(self.ssd_step_labels) != len(phases):
+                self._build_step_labels(self._ssd_step_row, phases,
+                                        self.ssd_step_labels)
+            labels = self.ssd_step_labels
+            self.ssd_progress.stop()
+            self.ssd_progress.configure(mode="determinate", value=0, maximum=100)
+            self.ssd_progress_label.configure(text="")
         else:
             if len(self.mod_step_labels) != len(phases):
                 self._build_step_labels(self._mod_step_row, phases,

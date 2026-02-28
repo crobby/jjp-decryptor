@@ -3891,6 +3891,303 @@ class StandaloneModPipeline(ModPipeline):
         self.log("Cleanup complete.", "success")
 
 
+# ==================================================================
+# Direct SSD pipelines — modify files on a physically-connected SSD
+# ==================================================================
+
+class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
+    """Decrypt files directly from a physically-connected JJP game SSD.
+
+    Skips the ISO extract phase entirely — mounts the SSD's ext4 partition
+    directly via WSL (Windows), Docker (macOS), or native mount (Linux).
+
+    Phases: Mount → Decrypt → Cleanup
+    """
+
+    def __init__(self, device_path, output_path, fl_dat_path,
+                 log_cb, phase_cb, progress_cb, done_cb):
+        # Pass device_path as image_path (we override mount logic)
+        super().__init__(device_path, output_path, fl_dat_path,
+                         log_cb, phase_cb, progress_cb, done_cb)
+        self.device_path = device_path  # e.g. \\.\PHYSICALDRIVE2 or /dev/sdb
+        self._ssd_mounted = False
+        self._wsl_mount_device = None  # for Windows wsl --unmount
+
+    def run(self):
+        """Execute the direct SSD decrypt pipeline."""
+        from .executor import DockerExecutor
+        cleanup_phase = len(config.DIRECT_SSD_PHASES) - 1
+        try:
+            self._log_system_diagnostics()
+            self.log(f"Direct SSD mode — device: {self.device_path}", "info")
+
+            # Verify output path is accessible
+            ok, msg = self.executor.check_path_accessible(self.output_path)
+            if not ok:
+                raise PipelineError("Mount", f"Output folder path error:\n{msg}")
+
+            # Start Docker container if on macOS
+            if isinstance(self.executor, DockerExecutor):
+                self.log("Starting Docker container...", "info")
+                self.executor.start_container([
+                    self.output_path, *_project_dirs()])
+
+            self.on_phase(0)  # Mount
+            self._mount_ssd(read_only=True)
+            self._check_cancel()
+
+            # Detect game name from the mount
+            self._detect_game()
+
+            self.on_phase(1)  # Decrypt
+            self._phase_decrypt_standalone()
+            self._check_cancel()
+
+            self._succeeded = True
+            self.on_phase(cleanup_phase)  # Cleanup
+            self._cleanup_ssd()
+            self.on_done(True, f"Decryption complete! Files saved to:\n{self.output_path}")
+
+        except PipelineError as e:
+            self.log(str(e), "error")
+            self.on_phase(cleanup_phase)
+            self._cleanup_ssd()
+            self.on_done(False, str(e))
+        except Exception as e:
+            self.log(f"Unexpected error: {e}", "error")
+            self.on_phase(cleanup_phase)
+            self._cleanup_ssd()
+            self.on_done(False, f"Unexpected error: {e}")
+
+    def _mount_ssd(self, read_only=True):
+        """Mount the SSD's game partition via platform-specific method."""
+        from .executor import WslExecutor, DockerExecutor, NativeExecutor
+        part_num = config.GAME_PARTITION_NUMBER
+
+        tag = uuid.uuid4().hex[:8]
+        self.mount_point = f"{config.MOUNT_PREFIX}ssd_{tag}"
+
+        if isinstance(self.executor, WslExecutor):
+            # Windows: use wsl --mount from the host side
+            device = self.device_path  # e.g. \\.\PHYSICALDRIVE2
+            self._wsl_mount_device = device
+            self.log(f"Attaching {device} partition {part_num} to WSL...", "info")
+
+            mount_cmd = f'wsl --mount "{device}" --partition {part_num} --type ext4'
+            if read_only:
+                mount_cmd += ' --options "ro"'
+            rc, stdout, stderr = self.executor.run_host(mount_cmd, timeout=30)
+            if rc != 0:
+                raise PipelineError("Mount",
+                    f"Failed to attach SSD to WSL:\n{stderr or stdout}\n\n"
+                    "Ensure you are running as Administrator.\n"
+                    "Note: wsl --mount may not support USB-connected drives "
+                    "on some systems. Try a direct SATA connection.")
+
+            # Find the mount point — wsl --mount puts it at /mnt/wsl/<diskname>
+            # The exact path depends on the device name
+            try:
+                result = self.executor.run(
+                    "findmnt -rn -o TARGET -t ext4 | grep -v '/mnt/c'",
+                    timeout=10)
+                # Find the most recently added mount
+                mounts = [m.strip() for m in result.strip().split("\n") if m.strip()]
+                if mounts:
+                    self.mount_point = mounts[-1]
+                    self._ssd_mounted = True
+                    self.log(f"SSD mounted at {self.mount_point}", "success")
+                else:
+                    raise PipelineError("Mount",
+                        "SSD was attached but mount point not found in WSL.")
+            except CommandError as e:
+                raise PipelineError("Mount",
+                    f"Could not find SSD mount point: {e.output}") from e
+
+        elif isinstance(self.executor, DockerExecutor):
+            # macOS: SSD must be unmounted from macOS, then accessed in Docker
+            device = self.device_path  # e.g. /dev/disk2
+            self.log(f"Preparing {device} for Docker access...", "info")
+
+            # Unmount from macOS first
+            rc, stdout, stderr = self.executor.run_host(
+                f"diskutil unmountDisk {device}", timeout=15)
+            if rc != 0:
+                self.log(f"Warning: could not unmount {device}: {stderr}", "info")
+
+            # Mount partition inside container
+            # Docker needs the device passed through; the container is already
+            # started with --privileged so it can see /dev/ devices
+            dev_partition = f"{device}s{part_num}"
+            mount_opts = "ro" if read_only else "rw"
+            try:
+                self.executor.run(f"mkdir -p {self.mount_point}", timeout=10)
+                self.executor.run(
+                    f"mount -t ext4 -o {mount_opts} '{dev_partition}' "
+                    f"{self.mount_point}",
+                    timeout=config.MOUNT_TIMEOUT)
+                self._ssd_mounted = True
+                self.log(f"SSD mounted at {self.mount_point}", "success")
+            except CommandError as e:
+                raise PipelineError("Mount",
+                    f"Failed to mount SSD in Docker:\n{e.output}") from e
+
+        elif isinstance(self.executor, NativeExecutor):
+            # Linux: direct mount
+            device = self.device_path  # e.g. /dev/sdb
+            dev_partition = f"{device}{part_num}"
+            mount_opts = "ro" if read_only else "rw"
+            self.log(f"Mounting {dev_partition} ({mount_opts})...", "info")
+            try:
+                self.executor.run(f"mkdir -p {self.mount_point}", timeout=10)
+                self.executor.run(
+                    f"mount -t ext4 -o {mount_opts} '{dev_partition}' "
+                    f"{self.mount_point}",
+                    timeout=config.MOUNT_TIMEOUT)
+                self._ssd_mounted = True
+                self.log(f"SSD mounted at {self.mount_point}", "success")
+            except CommandError as e:
+                raise PipelineError("Mount",
+                    f"Failed to mount SSD:\n{e.output}") from e
+
+        # Validate this looks like a JJP game partition
+        try:
+            self.executor.run(
+                f"test -d '{self.mount_point}{config.GAME_BASE_PATH}'",
+                timeout=10)
+        except CommandError:
+            raise PipelineError("Mount",
+                f"This doesn't look like a JJP game drive.\n"
+                f"Expected {config.GAME_BASE_PATH} not found on partition "
+                f"{part_num}.\n\n"
+                "Make sure you selected the correct drive.")
+
+    def _cleanup_ssd(self):
+        """Unmount the SSD and clean up."""
+        self.log("Cleaning up...", "info")
+        from .executor import WslExecutor, DockerExecutor
+
+        if self._ssd_mounted:
+            try:
+                # Sync before unmount
+                self.executor.run("sync", timeout=30)
+            except CommandError:
+                pass
+
+            if isinstance(self.executor, WslExecutor) and self._wsl_mount_device:
+                # Windows: use wsl --unmount from host
+                rc, stdout, stderr = self.executor.run_host(
+                    f'wsl --unmount "{self._wsl_mount_device}"', timeout=30)
+                if rc != 0:
+                    self.log(f"Warning: unmount may have failed: {stderr}", "info")
+            else:
+                # macOS/Linux: unmount inside executor
+                try:
+                    self.executor.run(
+                        f"umount '{self.mount_point}' 2>/dev/null; true",
+                        timeout=30)
+                except CommandError:
+                    pass
+                try:
+                    self.executor.run(
+                        f"rmdir '{self.mount_point}' 2>/dev/null; true",
+                        timeout=5)
+                except CommandError:
+                    pass
+
+            self._ssd_mounted = False
+
+        # Stop Docker container if applicable
+        if isinstance(self.executor, DockerExecutor):
+            try:
+                self.executor.stop_container()
+            except Exception:
+                pass
+
+        self.log("Cleanup complete.", "success")
+
+
+class DirectSSDModPipeline(StandaloneModPipeline):
+    """Modify files directly on a physically-connected JJP game SSD.
+
+    Skips the ISO extract, convert, and build phases. Writes encrypted
+    files directly to the SSD's ext4 partition.
+
+    Phases: Scan → Mount → Encrypt → Cleanup
+    """
+
+    def __init__(self, device_path, assets_folder, fl_dat_path,
+                 log_cb, phase_cb, progress_cb, done_cb):
+        super().__init__(device_path, assets_folder, fl_dat_path,
+                         log_cb, phase_cb, progress_cb, done_cb)
+        self.device_path = device_path
+        self._ssd_mounted = False
+        self._wsl_mount_device = None
+
+    def run(self):
+        """Execute the direct SSD mod pipeline."""
+        from .executor import DockerExecutor
+        cleanup_phase = len(config.DIRECT_SSD_MOD_PHASES) - 1
+        try:
+            self._log_system_diagnostics()
+            self.log(f"Direct SSD mod mode — device: {self.device_path}", "info")
+
+            # Verify assets folder is accessible
+            ok, msg = self.executor.check_path_accessible(self.assets_folder)
+            if not ok:
+                raise PipelineError("Scan", f"Assets folder path error:\n{msg}")
+
+            # Start Docker container if on macOS
+            if isinstance(self.executor, DockerExecutor):
+                self.log("Starting Docker container...", "info")
+                self.executor.start_container([
+                    self.assets_folder, *_project_dirs()])
+
+            self.on_phase(0)  # Scan
+            self._phase_scan()
+            self._check_cancel()
+
+            if not self.changed_files:
+                self.on_done(True,
+                    "No changes detected in the assets folder.\n"
+                    "Modify files in the output folder and try again.")
+                return
+
+            self.on_phase(1)  # Mount
+            # Reuse DirectSSDDecryptPipeline's mount logic
+            self._mount_ssd(read_only=False)
+            self._check_cancel()
+
+            self.on_phase(2)  # Encrypt
+            self._phase_encrypt_standalone()
+            self._check_cancel()
+
+            self._succeeded = True
+            self.on_phase(cleanup_phase)  # Cleanup
+            self._cleanup_ssd()
+
+            self.on_done(True,
+                "Asset modification complete!\n\n"
+                "The SSD has been updated directly. You can now:\n"
+                "1. Safely eject the drive\n"
+                "2. Install it back in the pinball machine\n"
+                "3. Power on — no USB flashing needed!")
+
+        except PipelineError as e:
+            self.log(str(e), "error")
+            self.on_phase(cleanup_phase)
+            self._cleanup_ssd()
+            self.on_done(False, str(e))
+        except Exception as e:
+            self.log(f"Unexpected error: {e}", "error")
+            self.on_phase(cleanup_phase)
+            self._cleanup_ssd()
+            self.on_done(False, f"Unexpected error: {e}")
+
+    # Reuse mount/unmount from DirectSSDDecryptPipeline
+    _mount_ssd = DirectSSDDecryptPipeline._mount_ssd
+    _cleanup_ssd = DirectSSDDecryptPipeline._cleanup_ssd
+
+
 def check_prerequisites(executor, standalone=False):
     """Check all prerequisites. Returns list of (name, passed, message) tuples."""
     import sys as _sys

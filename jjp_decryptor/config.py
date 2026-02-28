@@ -112,6 +112,23 @@ STANDALONE_MOD_PHASES = [
     "Cleanup",
 ]
 
+# Direct SSD pipeline phase names (no ISO extract/rebuild)
+DIRECT_SSD_PHASES = [
+    "Mount",
+    "Decrypt",
+    "Cleanup",
+]
+
+DIRECT_SSD_MOD_PHASES = [
+    "Scan",
+    "Mount",
+    "Encrypt",
+    "Cleanup",
+]
+
+# Partition number containing game data (1-indexed for wsl --mount)
+GAME_PARTITION_NUMBER = 3
+
 # Prerequisite names shown in the GUI (platform-aware)
 if sys.platform == "win32":
     PREREQ_NAMES = ["WSL2", "partclone", "xorriso"]
