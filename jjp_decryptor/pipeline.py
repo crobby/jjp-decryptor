@@ -3630,17 +3630,40 @@ class StandaloneModPipeline(ModPipeline):
             except CommandError:
                 pass
 
-            # Remount read-only — this commits the journal and ensures
-            # all writes are persisted to the raw image file.
-            remounted_ro = False
+            # Force the ext4 journal to commit so writes persist to the
+            # backing raw image.  We try three approaches in order:
+            #   1. fsfreeze (flushes journal + all dirty data, most reliable)
+            #   2. remount,ro (commits journal but fails if mount is "busy")
+            #   3. drop_caches + blockdev --flushbufs (best-effort fallback)
+            journal_flushed = False
+
+            # 1) fsfreeze: freeze flushes everything, then thaw to allow unmount
             try:
                 self.executor.run(
-                    f"mount -o remount,ro '{mp}'", timeout=60)
-                remounted_ro = True
-                self.log("  Remounted read-only (journal flushed).", "info")
-            except CommandError:
-                self.log("  Remount-ro failed, falling back to sync.",
+                    f"fsfreeze --freeze '{mp}'", timeout=60)
+                self.executor.run(
+                    f"fsfreeze --unfreeze '{mp}'", timeout=60)
+                journal_flushed = True
+                self.log("  Filesystem frozen and thawed (journal flushed).",
                          "info")
+            except CommandError:
+                pass
+
+            # 2) remount,ro: commits journal but can fail if processes hold it
+            if not journal_flushed:
+                try:
+                    self.executor.run(
+                        f"mount -o remount,ro '{mp}'", timeout=60)
+                    journal_flushed = True
+                    self.log("  Remounted read-only (journal flushed).",
+                             "info")
+                except CommandError:
+                    pass
+
+            # 3) Fallback: drop caches + flush block device buffers
+            if not journal_flushed:
+                self.log("  Journal flush failed, using best-effort sync.",
+                         "warning")
                 try:
                     self.executor.run(
                         "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; "
@@ -3689,11 +3712,11 @@ class StandaloneModPipeline(ModPipeline):
                             pass
 
             if not unmounted:
-                # With remount-ro already done, lazy unmount is safe —
+                # With journal already flushed, lazy unmount is safe —
                 # the data is already committed to the raw image.
                 self.log("Clean unmount failed after 5 attempts. "
                          "Trying lazy unmount...",
-                         "info" if remounted_ro else "error")
+                         "info" if journal_flushed else "error")
                 try:
                     self.executor.run(
                         f"umount -l '{mp}' 2>/dev/null; true",
