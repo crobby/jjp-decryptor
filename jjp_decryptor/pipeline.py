@@ -2658,9 +2658,18 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
         # Deploy crypto module to WSL /tmp
         self.log("Deploying Python crypto module to WSL...", "info")
         pkg_dir = os.path.dirname(os.path.abspath(__file__))
-        for module in ("crypto.py", "filelist.py"):
-            src = self.executor.to_exec_path(os.path.join(pkg_dir, module))
-            self.executor.run(f"cp '{src}' /tmp/jjp_{module}", timeout=10)
+        from .executor import DockerExecutor
+        if isinstance(self.executor, DockerExecutor):
+            # Docker: copy on host side into cache dir (already mounted as /tmp)
+            import shutil
+            cache_dir = self.executor._cache_dir()
+            for module in ("crypto.py", "filelist.py"):
+                shutil.copy2(os.path.join(pkg_dir, module),
+                             os.path.join(cache_dir, f"jjp_{module}"))
+        else:
+            for module in ("crypto.py", "filelist.py"):
+                src = self.executor.to_exec_path(os.path.join(pkg_dir, module))
+                self.executor.run(f"cp '{src}' /tmp/jjp_{module}", timeout=10)
 
         has_fl_dat = self.fl_dat_path and os.path.isfile(self.fl_dat_path)
 
