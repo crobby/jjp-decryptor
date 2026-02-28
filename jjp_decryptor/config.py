@@ -105,7 +105,7 @@ STANDALONE_PHASES = [
 STANDALONE_MOD_PHASES = [
     "Scan",
     "Extract",
-    "Mount",
+    "Prepare",
     "Encrypt",
     "Convert",
     "Build ISO",
@@ -114,7 +114,7 @@ STANDALONE_MOD_PHASES = [
 
 # Prerequisite names shown in the GUI (platform-aware)
 if sys.platform == "win32":
-    PREREQ_NAMES = ["WSL2", "partclone", "xorriso"]
+    PREREQ_NAMES = ["WSL2", "partclone", "xorriso", "debugfs"]
 elif sys.platform == "darwin":
     PREREQ_NAMES = ["Docker", "partclone", "xorriso"]
 else:

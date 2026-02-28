@@ -2993,54 +2993,106 @@ class StandaloneModPipeline(ModPipeline):
             self._phase_cleanup_standalone()
             self.on_done(False, f"Unexpected error: {e}")
 
+    # ---- debugfs helpers ----
+
+    def _debugfs_run(self, command, writable=False, timeout=120):
+        """Run a single debugfs command against the raw ext4 image.
+
+        Args:
+            command: debugfs command (e.g. 'ls /jjpe/gen1')
+            writable: open image read-write (-w flag)
+            timeout: seconds
+        Returns:
+            stdout string
+        """
+        w = "-w " if writable else ""
+        # Use single quotes around the image path (may contain spaces
+        # on the WSL side, though unlikely for /var/tmp paths).
+        # The debugfs command itself is passed via -R with double quotes;
+        # internal paths use debugfs's own double-quote escaping.
+        escaped = command.replace("'", "'\\''")
+        return self.executor.run(
+            f"debugfs {w}-R '{escaped}' '{self._wsl_img}' 2>&1",
+            timeout=timeout,
+        )
+
+    def _debugfs_dump_file(self, image_file_path, timeout=120):
+        """Extract a file from the ext4 image via debugfs dump.
+
+        Returns the file contents as bytes.
+        """
+        import base64 as _b64
+
+        dump_path = f"{self._debugfs_tmp}/dumped_file"
+        self._debugfs_run(
+            f'dump "{image_file_path}" "{dump_path}"',
+            timeout=timeout,
+        )
+        enc_b64 = self.executor.run(
+            f"base64 '{dump_path}'", timeout=timeout).strip()
+        self.executor.run(f"rm -f '{dump_path}'", timeout=5)
+        return _b64.b64decode(enc_b64)
+
+    # ---- Phase 2: Prepare (was Mount) ----
+
     def _phase_mount_rw(self):
-        """Mount the ext4 image read-write (no chroot/bind mounts needed)."""
-        self.log("Mounting ext4 image read-write...", "info")
+        """Prepare ext4 image for direct debugfs modification (no mount)."""
+        import uuid as _uuid
+
+        self.log("Preparing ext4 image for modification...", "info")
         if self._raw_img_path:
             wsl_img = self._raw_img_path
         else:
             wsl_img = self.executor.to_exec_path(self.image_path)
 
-        self._cleanup_stale_mounts(wsl_img)
-        import uuid as _uuid
+        self._wsl_img = wsl_img
+
+        # Clean up any stale mounts from previous (pre-debugfs) runs
+        try:
+            self._cleanup_stale_mounts(wsl_img)
+        except Exception:
+            pass
+
+        # Create staging directory for debugfs temp files
         tag = _uuid.uuid4().hex[:8]
-        self.mount_point = f"{config.MOUNT_PREFIX}{tag}"
+        self._debugfs_tmp = f"/var/tmp/jjp_debugfs_{tag}"
+        self.executor.run(f"mkdir -p '{self._debugfs_tmp}'", timeout=10)
 
+        # Validate the image is a valid ext4 filesystem
         try:
-            self.executor.run(f"mkdir -p {self.mount_point}", timeout=10)
-            # sync: every write goes directly to the backing file, so
-            # data persists even if clean unmount fails on WSL2.
-            self.executor.run(
-                f"mount -o loop,rw,sync '{wsl_img}' {self.mount_point}",
-                timeout=config.MOUNT_TIMEOUT,
-            )
-            self.log(f"Mounted at {self.mount_point}", "success")
+            self._debugfs_run("stats", timeout=30)
+            self.log("ext4 image validated.", "success")
         except CommandError as e:
-            raise PipelineError("Mount",
-                f"Failed to mount image: {e.output}") from e
+            raise PipelineError("Prepare",
+                f"Image is not a valid ext4 filesystem: {e.output}") from e
 
-        # Detect game name
+        # Detect game name via debugfs ls
         try:
-            result = self.executor.run(
-                f"ls -1 {self.mount_point}{config.GAME_BASE_PATH}/",
-                timeout=15,
-            )
-            for name in result.strip().split("\n"):
-                name = name.strip()
-                if not name:
+            result = self._debugfs_run(
+                f"ls {config.GAME_BASE_PATH}", timeout=15)
+            # debugfs ls output: inode (reclen) name
+            import re as _re
+            for name in _re.findall(r'\(\d+\)\s+(\S+)', result):
+                if name in ('.', '..'):
                     continue
-                game_path = (f"{self.mount_point}{config.GAME_BASE_PATH}/"
-                             f"{name}/game")
                 try:
-                    self.executor.run(f"test -f '{game_path}'", timeout=5)
-                    self.game_name = name
-                    display = config.KNOWN_GAMES.get(name, name)
-                    self.log(f"Detected game: {display} ({name})", "success")
-                    break
+                    stat_out = self._debugfs_run(
+                        f'stat "{config.GAME_BASE_PATH}/{name}/game"',
+                        timeout=10)
+                    if 'Inode:' in stat_out or 'Type: regular' in stat_out:
+                        self.game_name = name
+                        display = config.KNOWN_GAMES.get(name, name)
+                        self.log(f"Detected game: {display} ({name})",
+                                 "success")
+                        break
                 except CommandError:
                     pass
         except CommandError:
             pass
+
+        # No mount point — debugfs operates on the image file directly
+        self.mount_point = None
+        self.log("Image prepared for debugfs operations.", "success")
 
     # ------------------------------------------------------------------
     # Audio format helpers
@@ -3111,18 +3163,23 @@ class StandaloneModPipeline(ModPipeline):
                  "Game may reject this file.", "error")
         return content
 
-    def _get_original_wav_format(self, entry, mp):
+    def _get_original_wav_format(self, entry, mp=None):
         """Read the original encrypted file from the image, decrypt it,
         and return its WAV format dict (or None)."""
-        import base64 as _b64
         from .audio import detect_wav_format
         from .crypto import decrypt_file as _df
 
-        orig_path = f"{mp}{entry.path}"
         try:
-            enc_b64 = self.executor.run(
-                f"base64 '{orig_path}'", timeout=120).strip()
-            orig_enc = _b64.b64decode(enc_b64)
+            if hasattr(self, '_wsl_img') and self._wsl_img:
+                # debugfs path — read directly from unmounted image
+                orig_enc = self._debugfs_dump_file(entry.path, timeout=120)
+            else:
+                # mounted path fallback
+                import base64 as _b64
+                orig_path = f"{mp}{entry.path}"
+                enc_b64 = self.executor.run(
+                    f"base64 '{orig_path}'", timeout=120).strip()
+                orig_enc = _b64.b64decode(enc_b64)
             orig_dec = _df(orig_enc, entry.filler_size, entry.path)
             return detect_wav_format(orig_dec)
         except Exception:
@@ -3274,18 +3331,21 @@ class StandaloneModPipeline(ModPipeline):
                  "Game may ignore this file.", "error")
         return content
 
-    def _get_original_ogg_format(self, entry, mp):
+    def _get_original_ogg_format(self, entry, mp=None):
         """Read the original encrypted OGG from the image, decrypt it,
         and return its Vorbis format dict (or None)."""
-        import base64 as _b64
         from .audio import detect_ogg_format
         from .crypto import decrypt_file as _df
 
-        orig_path = f"{mp}{entry.path}"
         try:
-            enc_b64 = self.executor.run(
-                f"base64 '{orig_path}'", timeout=120).strip()
-            orig_enc = _b64.b64decode(enc_b64)
+            if hasattr(self, '_wsl_img') and self._wsl_img:
+                orig_enc = self._debugfs_dump_file(entry.path, timeout=120)
+            else:
+                import base64 as _b64
+                orig_path = f"{mp}{entry.path}"
+                enc_b64 = self.executor.run(
+                    f"base64 '{orig_path}'", timeout=120).strip()
+                orig_enc = _b64.b64decode(enc_b64)
             orig_dec = _df(orig_enc, entry.filler_size, entry.path)
             return detect_ogg_format(orig_dec)
         except Exception:
@@ -3357,8 +3417,13 @@ class StandaloneModPipeline(ModPipeline):
                         pass
 
     def _phase_encrypt_standalone(self):
-        """Re-encrypt changed files using pure Python crypto."""
+        """Re-encrypt changed files using pure Python crypto.
+
+        Writes encrypted files into the raw ext4 image via debugfs
+        (no mount needed).
+        """
         import os
+        import re as _re
         from .crypto import encrypt_file
         from .filelist import parse_fl_dat, detect_edata_prefix
 
@@ -3370,7 +3435,6 @@ class StandaloneModPipeline(ModPipeline):
         entry_map = {e.path: e for e in entries}
         self.log(f"Loaded {len(entries)} fl.dat entries.", "info")
 
-        mp = self.mount_point
         total = len(self.changed_files)
         ok = 0
         fail = 0
@@ -3397,10 +3461,10 @@ class StandaloneModPipeline(ModPipeline):
             lower = rel_path.lower()
             if lower.endswith(".wav"):
                 content = self._maybe_convert_audio(
-                    content, entry, mp, rel_path)
+                    content, entry, None, rel_path)
             elif lower.endswith(".ogg"):
                 content = self._maybe_convert_ogg(
-                    content, entry, mp, rel_path)
+                    content, entry, None, rel_path)
 
             self.log(f"Processing: {full_path}", "info")
             self.log(f"  filler={entry.filler_size} "
@@ -3435,20 +3499,14 @@ class StandaloneModPipeline(ModPipeline):
                 fail += 1
                 continue
 
-            # Write encrypted file to game image
+            # Stage encrypted file, then write into image via debugfs
             import base64 as _b64
             import hashlib as _hl
             enc_b64 = _b64.b64encode(encrypted).decode()
-            dest_path = f"{mp}{entry.path}"
-            dest_dir = dest_path.rsplit('/', 1)[0]
+            staging = f"{self._debugfs_tmp}/enc_{i:05d}.bin"
             expected_size = len(encrypted)
             try:
-                self.executor.run(f"mkdir -p '{dest_dir}'", timeout=10)
-                # Remove the old file first to avoid stale data when
-                # the new file is shorter than the original (WSL2 loop
-                # mounts can leave trailing bytes if we only redirect).
-                self.executor.run(
-                    f"rm -f '{dest_path}'", timeout=10)
+                # Write encrypted bytes to staging file in WSL
                 if len(enc_b64) > 100000:
                     import tempfile
                     with tempfile.NamedTemporaryFile(
@@ -3460,32 +3518,50 @@ class StandaloneModPipeline(ModPipeline):
                     wsl_tmp = self.executor.to_exec_path(tmp_win)
                     try:
                         self.executor.run(
-                            f"base64 -d '{wsl_tmp}' > '{dest_path}'",
+                            f"base64 -d '{wsl_tmp}' > '{staging}'",
                             timeout=60)
                     finally:
                         os.unlink(tmp_win)
                 else:
                     self.executor.run(
-                        f"echo '{enc_b64}' | base64 -d > '{dest_path}'",
+                        f"echo '{enc_b64}' | base64 -d > '{staging}'",
                         timeout=30)
-                # Force data to disk immediately so unmount doesn't lose it
-                self.executor.run(
-                    f"sync -d '{dest_path}' 2>/dev/null; true",
-                    timeout=15)
-                # Verify size right away to catch truncation issues early
+
+                # Verify staging file size
                 actual_size = int(self.executor.run(
-                    f"stat -c%s '{dest_path}'", timeout=5).strip())
+                    f"stat -c%s '{staging}'", timeout=5).strip())
                 if actual_size != expected_size:
                     self.log(
-                        f"[FAIL] {rel_path} (size mismatch after write: "
+                        f"[FAIL] {rel_path} (staging size mismatch: "
                         f"expected {expected_size}, got {actual_size})",
                         "error")
                     fail += 1
                     continue
+
+                # Remove old file from image, write new one via debugfs
+                self._debugfs_run(
+                    f'rm "{entry.path}"', writable=True, timeout=30)
+                self._debugfs_run(
+                    f'write "{staging}" "{entry.path}"',
+                    writable=True, timeout=120)
+
+                # Verify file was written by checking size via debugfs stat
+                stat_out = self._debugfs_run(
+                    f'stat "{entry.path}"', timeout=15)
+                m = _re.search(r'Size:\s*(\d+)', stat_out)
+                if m:
+                    disk_size = int(m.group(1))
+                    if disk_size != expected_size:
+                        self.log(
+                            f"[FAIL] {rel_path} (debugfs size mismatch: "
+                            f"expected {expected_size}, got {disk_size})",
+                            "error")
+                        fail += 1
+                        continue
+
                 self.log(f"[VERIFY OK] {rel_path}", "success")
                 ok += 1
-                # Save expected MD5 + size for the first file so the
-                # post-unmount spot-check can do a real comparison.
+                # Save expected MD5 + size for the post-write spot-check
                 if not hasattr(self, '_expected_spot'):
                     self._expected_spot = {
                         'md5': _hl.md5(encrypted).hexdigest(),
@@ -3511,15 +3587,14 @@ class StandaloneModPipeline(ModPipeline):
                  "success")
 
     def _verify_raw_image(self, wsl_img):
-        """Spot-check that modifications survived unmount by mounting the raw
-        image read-only and comparing against expected encrypted bytes.
+        """Spot-check modifications via debugfs dump (no mount needed).
+
+        Reads the first changed file back from the image, compares MD5/size
+        against expected values, then decrypts and compares content against
+        the replacement file.
 
         Raises PipelineError if verification fails — the ISO would be broken.
         """
-        import uuid as _uuid
-        tag = _uuid.uuid4().hex[:8]
-        check_mp = f"/var/tmp/jjp_check_{tag}"
-
         # Pick the first changed file for a quick spot-check
         rel_path, win_path = self.changed_files[0]
         from .filelist import parse_fl_dat, detect_edata_prefix
@@ -3532,18 +3607,12 @@ class StandaloneModPipeline(ModPipeline):
         expected = getattr(self, '_expected_spot', None)
         verification_failed = False
 
-        self.log("Verifying modifications persisted in raw image...", "info")
+        self.log("Verifying modifications in raw image (debugfs)...", "info")
         try:
-            self.executor.run(f"mkdir -p {check_mp}", timeout=5)
-            self.executor.run(
-                f"mount -o loop,ro '{wsl_img}' {check_mp}", timeout=30)
-            check_path = f"{check_mp}{full_path}"
-
-            # Get MD5 and size of the encrypted file on disk
-            raw_md5 = self.executor.run(
-                f"md5sum '{check_path}' | cut -d' ' -f1", timeout=60).strip()
-            raw_size = int(self.executor.run(
-                f"stat -c%s '{check_path}'", timeout=5).strip())
+            disk_encrypted = self._debugfs_dump_file(full_path, timeout=120)
+            import hashlib as _hl
+            raw_md5 = _hl.md5(disk_encrypted).hexdigest()
+            raw_size = len(disk_encrypted)
 
             # Compare against what the encrypt phase wrote
             if expected:
@@ -3552,7 +3621,7 @@ class StandaloneModPipeline(ModPipeline):
                 if md5_match and size_match:
                     self.log(
                         f"  Encrypted bytes match expected "
-                        f"(md5={raw_md5[:12]}…, size={raw_size})",
+                        f"(md5={raw_md5[:12]}..., size={raw_size})",
                         "success")
                 else:
                     verification_failed = True
@@ -3560,36 +3629,31 @@ class StandaloneModPipeline(ModPipeline):
                         f"  FAILED: Encrypted bytes do NOT match!",
                         "error")
                     self.log(
-                        f"    Expected: md5={expected['md5'][:12]}… "
+                        f"    Expected: md5={expected['md5'][:12]}... "
                         f"size={expected['size']}",
                         "error")
                     self.log(
-                        f"    On disk:  md5={raw_md5[:12]}… size={raw_size}",
+                        f"    On disk:  md5={raw_md5[:12]}... size={raw_size}",
                         "error")
 
-            # Read the encrypted file back, decrypt it, and compare content
-            # against the replacement file to prove the round-trip works.
+            # Decrypt and compare content against the replacement file
             if entry and not verification_failed:
-                import base64 as _b64
-                enc_b64 = self.executor.run(
-                    f"base64 '{check_path}'", timeout=120).strip()
-                disk_encrypted = _b64.b64decode(enc_b64)
                 from .crypto import decrypt_file as _df
-                import hashlib as _hl
                 disk_decrypted = _df(
                     disk_encrypted, entry.filler_size, entry.path)
                 # Strip the 4-byte CRC forgery suffix to get original content
-                disk_content = disk_decrypted[:-4] if len(disk_decrypted) > 4 else disk_decrypted
+                disk_content = (disk_decrypted[:-4]
+                                if len(disk_decrypted) > 4
+                                else disk_decrypted)
                 disk_content_md5 = _hl.md5(disk_content).hexdigest()
 
-                # Compare against the replacement file
                 with open(win_path, 'rb') as fh:
                     replacement_md5 = _hl.md5(fh.read()).hexdigest()
 
                 if disk_content_md5 == replacement_md5:
                     self.log(
                         f"  Content round-trip verified: {rel_path} "
-                        f"(md5={disk_content_md5[:12]}…)",
+                        f"(md5={disk_content_md5[:12]}...)",
                         "success")
                 else:
                     verification_failed = True
@@ -3598,250 +3662,31 @@ class StandaloneModPipeline(ModPipeline):
                         f"replacement file!",
                         "error")
                     self.log(
-                        f"    Replacement: md5={replacement_md5[:12]}…",
+                        f"    Replacement: md5={replacement_md5[:12]}...",
                         "error")
                     self.log(
-                        f"    On disk:     md5={disk_content_md5[:12]}…",
+                        f"    On disk:     md5={disk_content_md5[:12]}...",
                         "error")
 
-            self.executor.run(
-                f"umount -l '{check_mp}' 2>/dev/null; "
-                f"rmdir '{check_mp}' 2>/dev/null; true", timeout=15)
         except Exception as e:
             self.log(f"  Raw image spot-check skipped: {e}", "info")
-            try:
-                self.executor.run(
-                    f"umount -l '{check_mp}' 2>/dev/null; "
-                    f"rmdir '{check_mp}' 2>/dev/null; true", timeout=15)
-            except CommandError:
-                pass
 
         if verification_failed:
             raise PipelineError(
                 "Verification",
                 "Modified files did not persist to the raw image.\n\n"
-                "This is typically caused by WSL2 not flushing writes to disk "
-                "before unmounting. The ISO was NOT built.\n\n"
-                "Please try again. If this keeps happening, try:\n"
-                "  1. Run 'wsl --shutdown' in a Windows terminal\n"
-                "  2. Close other programs using WSL\n"
-                "  3. Restart the mod pipeline"
+                "debugfs write may have failed. The ISO was NOT built.\n\n"
+                "Please check the log for errors and try again."
             )
 
     def _phase_convert_standalone(self):
-        """Unmount and convert - same as parent but no bind mounts to clean."""
-        if self.mount_point:
-            mp = self.mount_point
-            wsl_img = self._raw_img_path
+        """Verify, repair, and convert the modified raw image.
 
-            # ---- Flush ext4 journal before unmount ----
-            # WSL2 lazy unmount can lose writes if the ext4 journal hasn't
-            # committed.  We try multiple approaches with generous timeouts
-            # (32 GB images on slow I/O can take minutes to sync).
-            self.log("Syncing filesystem before unmount...", "info")
-            try:
-                self.executor.run(f"sync -f '{mp}/'", timeout=120)
-            except CommandError:
-                pass
-            try:
-                self.executor.run("sync", timeout=120)
-            except CommandError:
-                pass
+        No unmount needed — debugfs wrote directly to the image file.
+        """
+        wsl_img = self._wsl_img
 
-            # Force the ext4 journal to commit so writes persist to the
-            # backing raw image.  We try three approaches in order:
-            #   1. fsfreeze (flushes journal + all dirty data, most reliable)
-            #   2. remount,ro (commits journal but fails if mount is "busy")
-            #   3. drop_caches + blockdev --flushbufs (best-effort fallback)
-            journal_flushed = False
-
-            # 1) fsfreeze: freeze flushes everything, then thaw to allow unmount
-            try:
-                self.executor.run(
-                    f"fsfreeze --freeze '{mp}'", timeout=180)
-                self.executor.run(
-                    f"fsfreeze --unfreeze '{mp}'", timeout=60)
-                journal_flushed = True
-                self.log("  Filesystem frozen and thawed (journal flushed).",
-                         "info")
-            except CommandError:
-                pass
-
-            # 2) remount,ro: commits journal but can fail if processes hold it
-            if not journal_flushed:
-                try:
-                    self.executor.run(
-                        f"mount -o remount,ro '{mp}'", timeout=180)
-                    journal_flushed = True
-                    self.log("  Remounted read-only (journal flushed).",
-                             "info")
-                except CommandError:
-                    pass
-
-            # 3) Fallback: drop caches + flush block device buffers
-            if not journal_flushed:
-                self.log("  Journal flush failed, using best-effort sync.",
-                         "warning")
-                try:
-                    self.executor.run(
-                        "echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; "
-                        "true", timeout=30)
-                except CommandError:
-                    pass
-                try:
-                    loop_dev = self.executor.run(
-                        f"losetup -j '{wsl_img}' 2>/dev/null | "
-                        f"head -1 | cut -d: -f1",
-                        timeout=10).strip()
-                    if loop_dev:
-                        self.executor.run(
-                            f"blockdev --flushbufs '{loop_dev}' "
-                            f"2>/dev/null; true", timeout=30)
-                except CommandError:
-                    pass
-
-            # 4) Two-level flush: explicitly fdatasync the backing file.
-            # Loop-mounted ext4 has two cache layers:
-            #   inner ext4 → loop device page cache → backing file
-            # The sync above flushes inner ext4 to the loop device,
-            # but the loop device's pages may not be flushed to the
-            # backing file on the outer filesystem. fdatasync forces it.
-            try:
-                self.executor.run(
-                    f"python3 -c \""
-                    f"import os; fd=os.open('{wsl_img}', os.O_RDWR); "
-                    f"os.fdatasync(fd); os.close(fd)\"",
-                    timeout=180)
-                self.log("  Backing file synced (fdatasync).", "info")
-            except CommandError:
-                # Fall back to sync -f on the backing file
-                try:
-                    self.executor.run(
-                        f"sync -f '{wsl_img}'", timeout=120)
-                    self.log("  Backing file synced (sync -f).", "info")
-                except CommandError:
-                    pass
-
-            # ---- Unmount with retry ----
-            # First, kill anything holding the mount busy so clean
-            # unmount can succeed.  fuser -k sends SIGKILL to all
-            # processes with open files on the mount point.
-            try:
-                self.executor.run(
-                    f"fuser -km '{mp}' 2>/dev/null; true", timeout=15)
-            except CommandError:
-                pass
-
-            self.log("Unmounting ext4 for conversion...", "info")
-            unmounted = False
-            for attempt in range(5):
-                try:
-                    self.executor.run(
-                        f"umount '{mp}'", timeout=60)
-                    unmounted = True
-                    break
-                except CommandError:
-                    if attempt < 4:
-                        self.log(f"  Unmount attempt {attempt + 1} failed, "
-                                 "waiting for I/O to settle...", "info")
-                        if attempt == 0:
-                            try:
-                                blockers = self.executor.run(
-                                    f"fuser -vm '{mp}' 2>&1 || true",
-                                    timeout=10).strip()
-                                if blockers:
-                                    self.log(f"  Processes using mount: "
-                                             f"{blockers}", "info")
-                            except CommandError:
-                                pass
-                            # Kill again in case new processes appeared
-                            try:
-                                self.executor.run(
-                                    f"fuser -km '{mp}' 2>/dev/null; true",
-                                    timeout=15)
-                            except CommandError:
-                                pass
-                        try:
-                            self.executor.run(
-                                "sync; sleep 2; sync", timeout=60)
-                        except CommandError:
-                            pass
-
-            if not unmounted:
-                # With journal already flushed, lazy unmount is safe —
-                # the data is already committed to the raw image.
-                self.log("Clean unmount failed after 5 attempts. "
-                         "Trying lazy unmount...",
-                         "info" if journal_flushed else "error")
-                try:
-                    self.executor.run(
-                        f"umount -l '{mp}' 2>/dev/null; true",
-                        timeout=30)
-                except CommandError:
-                    pass
-
-                # Try sync — if it times out, WSL2's I/O is stalled.
-                wsl_hung = False
-                try:
-                    self.executor.run("sync", timeout=120)
-                except CommandError:
-                    wsl_hung = True
-
-                if wsl_hung:
-                    # WSL2's I/O subsystem is completely stalled after
-                    # lazy unmount on a large loop-mounted image.
-                    # Terminating WSL2 forces a clean VM shutdown, which
-                    # flushes all pending I/O to the VHD.  On restart,
-                    # the raw image file will be intact.
-                    self.log("WSL2 I/O stalled after unmount. "
-                             "Restarting WSL2 to flush pending writes...",
-                             "warning")
-                    import subprocess as _sp
-                    try:
-                        _sp.run(["wsl", "--shutdown"],
-                                timeout=60, capture_output=True)
-                    except Exception:
-                        pass
-                    import time as _time
-                    _time.sleep(5)
-                    self.log("WSL2 restarted.", "info")
-                else:
-                    # Give the kernel time to settle after lazy unmount
-                    try:
-                        self.executor.run("sleep 5", timeout=10)
-                    except CommandError:
-                        pass
-
-            try:
-                self.executor.run(
-                    f"rmdir '{mp}' 2>/dev/null; true", timeout=5)
-            except CommandError:
-                pass
-            self.mount_point = None
-
-        wsl_img = self._raw_img_path
-
-        # Verify the raw image survived unmount
-        try:
-            stat_out = self.executor.run(
-                f"stat --format='%s bytes, inode %i' '{wsl_img}' 2>&1",
-                timeout=30).strip()
-            self.log(f"  Raw image: {stat_out}", "info")
-        except CommandError as e:
-            try:
-                loops = self.executor.run(
-                    "losetup -a 2>/dev/null || true", timeout=5).strip()
-                if loops:
-                    self.log(f"  Active loop devices: {loops}", "info")
-            except CommandError:
-                pass
-            raise PipelineError("Convert",
-                f"Raw image not found after unmount: {wsl_img}\n"
-                f"stat output: {e.output}\n\n"
-                "This may be caused by WSL2 discarding cached data "
-                "during unmount. Please try running the mod pipeline again.")
-
-        # Verify modifications survived unmount by spot-checking raw image
+        # Verify modifications via debugfs dump
         if self.changed_files:
             self.on_progress(0, 100, "Verifying raw image...")
             self._verify_raw_image(wsl_img)
@@ -4032,6 +3877,7 @@ class StandaloneModPipeline(ModPipeline):
         """Simplified cleanup - no daemon or USB."""
         self.log("Cleaning up...", "info")
 
+        # mount_point is None when using debugfs (no mount to undo)
         if self.mount_point:
             try:
                 self.executor.run(
@@ -4043,6 +3889,14 @@ class StandaloneModPipeline(ModPipeline):
                 self.executor.run(
                     f"rmdir '{self.mount_point}' 2>/dev/null; true",
                     timeout=5)
+            except CommandError:
+                pass
+
+        # Clean up debugfs staging directory
+        if hasattr(self, '_debugfs_tmp') and self._debugfs_tmp:
+            try:
+                self.executor.run(
+                    f"rm -rf '{self._debugfs_tmp}'", timeout=60)
             except CommandError:
                 pass
 
@@ -4111,6 +3965,13 @@ def check_prerequisites(executor, standalone=False):
         except Exception:
             results.append(("xorriso", False,
                 "Not installed. Run: wsl -u root -- apt install xorriso"))
+
+        try:
+            executor.run("which debugfs", timeout=10)
+            results.append(("debugfs", True, "Available"))
+        except Exception:
+            results.append(("debugfs", False,
+                "Not installed. Run: wsl -u root -- apt install e2fsprogs"))
 
     elif isinstance(executor, DockerExecutor):
         # macOS: check Docker Desktop
