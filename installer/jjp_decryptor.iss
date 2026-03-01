@@ -43,7 +43,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"
-Name: "runprereqs"; Description: "Install prerequisites after setup (WSL2, partclone, xorriso)"; GroupDescription: "Prerequisites:"; Flags: unchecked
+Name: "runprereqs"; Description: "Install prerequisites after setup (WSL2, partclone, xorriso, debugfs, pigz, ffmpeg)"; GroupDescription: "Prerequisites:"; Flags: unchecked
 
 [Files]
 ; Bundled Python with tkinter
@@ -80,7 +80,7 @@ Source: "{#ProjectDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 [Icons]
 ; Start Menu
 Name: "{group}\JJP Asset Decryptor"; Filename: "wscript.exe"; Parameters: """{app}\launcher.vbs"""; WorkingDir: "{app}"; IconFilename: "{app}\jjp_decryptor\icon.ico"; Comment: "Decrypt and modify JJP pinball game assets"
-Name: "{group}\Install Prerequisites"; Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install_prerequisites.ps1"""; WorkingDir: "{app}"; Comment: "Install WSL2, partclone, xorriso"
+Name: "{group}\Install Prerequisites"; Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install_prerequisites.ps1"""; WorkingDir: "{app}"; Comment: "Install WSL2, partclone, xorriso, debugfs, pigz, ffmpeg"
 Name: "{group}\{cm:UninstallProgram,JJP Asset Decryptor}"; Filename: "{uninstallexe}"
 
 ; Desktop shortcut (optional)
