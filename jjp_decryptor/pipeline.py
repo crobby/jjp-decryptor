@@ -3973,6 +3973,20 @@ def check_prerequisites(executor, standalone=False):
             results.append(("debugfs", False,
                 "Not installed. Run: wsl -u root -- apt install e2fsprogs"))
 
+        try:
+            executor.run("which pigz", timeout=10)
+            results.append(("pigz", True, "Available"))
+        except Exception:
+            results.append(("pigz", False,
+                "Not installed. Run: wsl -u root -- apt install pigz"))
+
+        try:
+            executor.run("which ffmpeg", timeout=10)
+            results.append(("ffmpeg", True, "Available"))
+        except Exception:
+            results.append(("ffmpeg", False,
+                "Not installed. Run: wsl -u root -- apt install ffmpeg"))
+
     elif isinstance(executor, DockerExecutor):
         # macOS: check Docker Desktop
         ok, msg = executor.check_available()
@@ -4012,5 +4026,26 @@ def check_prerequisites(executor, standalone=False):
         except Exception:
             results.append(("xorriso", False,
                 "Not installed. Run: sudo apt install xorriso"))
+
+        try:
+            executor.run("which debugfs", timeout=10)
+            results.append(("debugfs", True, "Available"))
+        except Exception:
+            results.append(("debugfs", False,
+                "Not installed. Run: sudo apt install e2fsprogs"))
+
+        try:
+            executor.run("which pigz", timeout=10)
+            results.append(("pigz", True, "Available"))
+        except Exception:
+            results.append(("pigz", False,
+                "Not installed. Run: sudo apt install pigz"))
+
+        try:
+            executor.run("which ffmpeg", timeout=10)
+            results.append(("ffmpeg", True, "Available"))
+        except Exception:
+            results.append(("ffmpeg", False,
+                "Not installed. Run: sudo apt install ffmpeg"))
 
     return results

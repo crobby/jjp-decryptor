@@ -32,7 +32,7 @@ No USB dongle, gcc, or usbipd-win required. No additional Python packages needed
 ### Windows
 - **Windows 10/11** with WSL2 enabled
 - **WSL2** with Ubuntu (or similar): `wsl --install`
-- **partclone**, **xorriso**, and **e2fsprogs** (provides `debugfs`) in WSL — the app has an **Install Missing** button that installs these automatically, or install manually: `wsl -u root -- apt install partclone xorriso e2fsprogs`
+- **partclone**, **xorriso**, **e2fsprogs** (provides `debugfs`), **pigz**, and **ffmpeg** in WSL — the app has an **Install Missing** button that installs these automatically, or install manually: `wsl -u root -- apt install partclone xorriso e2fsprogs pigz ffmpeg`
 - **Rufus** (for writing modified ISOs to USB): [rufus.ie](https://rufus.ie/)
 
 ### macOS
@@ -45,6 +45,7 @@ No USB dongle, gcc, or usbipd-win required. No additional Python packages needed
 - **xorriso**: `sudo apt install xorriso`
 - **e2fsprogs** (provides `debugfs`): `sudo apt install e2fsprogs`
 - **pigz**: `sudo apt install pigz`
+- **ffmpeg**: `sudo apt install ffmpeg`
 - Requires `sudo` for the decrypt pipeline (loop-mounting ext4 images for read-only access)
 - **dd** or **balenaEtcher** for writing modified ISOs to USB
 
@@ -57,7 +58,7 @@ Download from the [Releases page](https://github.com/davidvanderburgh/jjp-decryp
 - **Windows**: `JJP_Asset_Decryptor_Setup.exe` — includes bundled Python runtime
 - **macOS**: `JJP_Asset_Decryptor.dmg` — drag to Applications (see macOS note below)
 
-**Windows installer note**: When prompted, check **Install prerequisites** to set up WSL2, partclone, xorriso, and debugfs. If WSL2 was just enabled, reboot and re-run the prerequisites installer from the Start Menu.
+**Windows installer note**: When prompted, check **Install prerequisites** to set up WSL2, partclone, xorriso, debugfs, pigz, and ffmpeg. If WSL2 was just enabled, reboot and re-run the prerequisites installer from the Start Menu.
 
 **macOS note**: On first launch, macOS will block the app because it is not notarized with Apple. This is a one-time setup:
 

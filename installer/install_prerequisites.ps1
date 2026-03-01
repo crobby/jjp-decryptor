@@ -9,6 +9,8 @@
     - partclone (partition imaging in WSL)
     - xorriso (ISO manipulation in WSL)
     - debugfs / e2fsprogs (ext4 image tools in WSL)
+    - pigz (parallel gzip compression in WSL)
+    - ffmpeg (audio/video conversion in WSL)
 
     This script is safe to re-run — it checks before installing and skips
     anything that is already present.
@@ -222,6 +224,72 @@ if ($wslAvailable -and $ubuntuFound) {
 }
 
 # ============================================================
+# 6. pigz in WSL
+# ============================================================
+Write-Step "Checking pigz in WSL..."
+
+if ($wslAvailable -and $ubuntuFound) {
+    $pzFound = $false
+    try {
+        wsl -u root -- which pigz 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $pzFound = $true
+            Write-OK "pigz"
+        }
+    } catch {}
+
+    if (-not $pzFound) {
+        Write-Host "  Installing pigz..." -ForegroundColor Cyan
+        wsl -u root -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pigz" 2>&1 | ForEach-Object { Write-Host "    $_" }
+        try {
+            wsl -u root -- which pigz 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Installed "pigz"
+            } else {
+                Write-FAIL "pigz"
+            }
+        } catch {
+            Write-FAIL "pigz"
+        }
+    }
+} else {
+    Write-SKIP "pigz (WSL/Ubuntu not available yet)"
+}
+
+# ============================================================
+# 7. ffmpeg in WSL
+# ============================================================
+Write-Step "Checking ffmpeg in WSL..."
+
+if ($wslAvailable -and $ubuntuFound) {
+    $ffFound = $false
+    try {
+        wsl -u root -- which ffmpeg 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $ffFound = $true
+            Write-OK "ffmpeg"
+        }
+    } catch {}
+
+    if (-not $ffFound) {
+        Write-Host "  Installing ffmpeg..." -ForegroundColor Cyan
+        wsl -u root -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg" 2>&1 | ForEach-Object { Write-Host "    $_" }
+        try {
+            wsl -u root -- which ffmpeg 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Installed "ffmpeg"
+            } else {
+                Write-FAIL "ffmpeg"
+            }
+        } catch {
+            Write-FAIL "ffmpeg"
+        }
+    }
+} else {
+    Write-SKIP "ffmpeg (WSL/Ubuntu not available yet)"
+}
+
+# ============================================================
 # Summary
 # ============================================================
 Write-Host "`n"
@@ -251,7 +319,7 @@ if ($needsReboot) {
     Write-Host "  After rebooting, run this script again" -ForegroundColor Yellow
     Write-Host "  from the Start Menu to install the" -ForegroundColor Yellow
     Write-Host "  remaining WSL prerequisites (partclone," -ForegroundColor Yellow
-    Write-Host "  xorriso, debugfs)." -ForegroundColor Yellow
+    Write-Host "  xorriso, debugfs, pigz, ffmpeg)." -ForegroundColor Yellow
     Write-Host "============================================" -ForegroundColor Yellow
     Write-Host ""
     $reboot = Read-Host "  Reboot now? (y/n)"

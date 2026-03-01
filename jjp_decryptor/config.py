@@ -114,8 +114,8 @@ STANDALONE_MOD_PHASES = [
 
 # Prerequisite names shown in the GUI (platform-aware)
 if sys.platform == "win32":
-    PREREQ_NAMES = ["WSL2", "partclone", "xorriso", "debugfs"]
+    PREREQ_NAMES = ["WSL2", "partclone", "xorriso", "debugfs", "pigz", "ffmpeg"]
 elif sys.platform == "darwin":
     PREREQ_NAMES = ["Docker", "partclone", "xorriso"]
 else:
-    PREREQ_NAMES = ["System", "partclone", "xorriso"]
+    PREREQ_NAMES = ["System", "partclone", "xorriso", "debugfs", "pigz", "ffmpeg"]

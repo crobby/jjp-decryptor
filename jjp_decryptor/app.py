@@ -270,7 +270,7 @@ class App:
             self._install_prereqs_native()
 
     def _install_prereqs_wsl(self):
-        """Install partclone + xorriso inside WSL and prompt for restart."""
+        """Install all WSL prerequisites and prompt for restart."""
         self.window.append_log("Installing prerequisites in WSL...", "info")
         self.window.install_btn.configure(state=tk.DISABLED)
 
@@ -278,7 +278,7 @@ class App:
             try:
                 for line in self.executor.stream(
                     "apt-get update -qq && "
-                    "apt-get install -y partclone xorriso e2fsprogs 2>&1",
+                    "apt-get install -y partclone xorriso e2fsprogs pigz ffmpeg 2>&1",
                     timeout=300,
                 ):
                     self.msg_queue.put(LogMsg(f"  {line}", "info"))
@@ -308,7 +308,7 @@ class App:
         threading.Thread(target=_run, daemon=True).start()
 
     def _install_prereqs_native(self):
-        """Install partclone + xorriso on native Linux."""
+        """Install all prerequisites on native Linux."""
         self.window.append_log("Installing prerequisites...", "info")
         self.window.install_btn.configure(state=tk.DISABLED)
 
@@ -316,7 +316,7 @@ class App:
             try:
                 for line in self.executor.stream(
                     "apt-get update -qq && "
-                    "apt-get install -y partclone xorriso e2fsprogs 2>&1",
+                    "apt-get install -y partclone xorriso e2fsprogs pigz ffmpeg 2>&1",
                     timeout=300,
                 ):
                     self.msg_queue.put(LogMsg(f"  {line}", "info"))
