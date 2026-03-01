@@ -2578,6 +2578,18 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
         try:
             self._log_system_diagnostics()
 
+            # Check core prerequisites before starting
+            prereq_results = check_prerequisites(self.executor, standalone=True)
+            # Decrypt pipeline only needs WSL/Docker/System + partclone + xorriso
+            core = {"WSL2", "partclone", "xorriso", "Docker", "System"}
+            missing = [name for name, passed, _ in prereq_results
+                       if not passed and name in core]
+            if missing:
+                raise PipelineError("Extract",
+                    f"Missing prerequisites: {', '.join(missing)}\n\n"
+                    "Click 'Install Missing' on the main screen to install "
+                    "them, or install manually and restart the app.")
+
             # Verify both paths are accessible from the executor
             for label, path in [("Game image", self.image_path),
                                 ("Output folder", self.output_path)]:
@@ -2867,6 +2879,15 @@ class StandaloneModPipeline(ModPipeline):
         cleanup_phase = len(config.STANDALONE_MOD_PHASES) - 1
         try:
             self._log_system_diagnostics()
+
+            # Check all prerequisites before starting
+            prereq_results = check_prerequisites(self.executor, standalone=True)
+            missing = [name for name, passed, _ in prereq_results if not passed]
+            if missing:
+                raise PipelineError("Scan",
+                    f"Missing prerequisites: {', '.join(missing)}\n\n"
+                    "Click 'Install Missing' on the main screen to install "
+                    "them, or install manually and restart the app.")
 
             # Verify both paths are accessible from the executor
             for label, path in [("Game image", self.image_path),
