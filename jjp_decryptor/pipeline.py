@@ -3124,7 +3124,8 @@ class StandaloneModPipeline(ModPipeline):
 
         Reads the original encrypted file from the mounted image, decrypts
         it, compares WAV format against the replacement, and converts if
-        they differ.  Returns (possibly converted) content bytes.
+        they differ.  Also matches duration to the original.
+        Returns (possibly converted) content bytes.
         """
         import os
         import base64 as _b64
@@ -3145,7 +3146,9 @@ class StandaloneModPipeline(ModPipeline):
                     converted = self._convert_wav_ffmpeg(
                         content, orig_fmt, rel_path)
                     if converted is not None:
-                        return converted
+                        # Match duration after format conversion
+                        return self._resize_wav_to_duration(
+                            converted, orig_fmt, rel_path)
                 self.log(f"  Warning: could not convert compressed WAV",
                          "error")
             return content  # not a WAV we can parse; pass through
@@ -3158,7 +3161,9 @@ class StandaloneModPipeline(ModPipeline):
         if wav_formats_match(repl_fmt, orig_fmt):
             self.log(f"  Audio format OK: {format_description(repl_fmt)}",
                      "info")
-            return content
+            # Format matches but duration might differ — resize if needed
+            return self._resize_wav_to_duration(
+                content, orig_fmt, rel_path)
 
         diff = format_diff(repl_fmt, orig_fmt)
         self.log(f"  Audio format mismatch: {diff}", "info")
@@ -3170,7 +3175,8 @@ class StandaloneModPipeline(ModPipeline):
                 self.log(f"  Converted (Python): "
                          f"{format_description(repl_fmt)} -> "
                          f"{format_description(orig_fmt)}", "success")
-                return converted
+                return self._resize_wav_to_duration(
+                    converted, orig_fmt, rel_path)
 
         # Need ffmpeg for sample rate conversion
         converted = self._convert_wav_ffmpeg(content, orig_fmt, rel_path)
@@ -3178,7 +3184,8 @@ class StandaloneModPipeline(ModPipeline):
             self.log(f"  Converted (ffmpeg): "
                      f"{format_description(repl_fmt)} -> "
                      f"{format_description(orig_fmt)}", "success")
-            return converted
+            return self._resize_wav_to_duration(
+                converted, orig_fmt, rel_path)
 
         self.log(f"  Warning: could not convert {rel_path} ({diff}). "
                  "Game may reject this file.", "error")
@@ -3202,7 +3209,10 @@ class StandaloneModPipeline(ModPipeline):
                     f"base64 '{orig_path}'", timeout=120).strip()
                 orig_enc = _b64.b64decode(enc_b64)
             orig_dec = _df(orig_enc, entry.filler_size, entry.path)
-            return detect_wav_format(orig_dec)
+            fmt = detect_wav_format(orig_dec)
+            if fmt is not None:
+                fmt["_orig_size"] = len(orig_dec)
+            return fmt
         except Exception:
             return None
 
@@ -3301,6 +3311,59 @@ class StandaloneModPipeline(ModPipeline):
                     except OSError:
                         pass
 
+    def _resize_wav_to_duration(self, content, orig_fmt, rel_path):
+        """Trim or pad WAV to match the original's exact frame count.
+
+        Pure Python implementation — no ffmpeg needed. Truncates extra
+        frames or pads with silence to match orig_fmt["nframes"].
+        Returns resized WAV bytes, or original content on failure.
+        """
+        import io as _io
+        import wave
+        from .audio import detect_wav_format
+
+        repl_fmt = detect_wav_format(content)
+        if repl_fmt is None:
+            return content
+
+        target_nframes = orig_fmt["nframes"]
+        repl_nframes = repl_fmt["nframes"]
+        if repl_nframes == target_nframes:
+            return content
+
+        try:
+            with wave.open(_io.BytesIO(content), "rb") as w:
+                raw_frames = w.readframes(w.getnframes())
+
+            nch = orig_fmt["nchannels"]
+            sw = orig_fmt["sampwidth"]
+            target_bytes = target_nframes * nch * sw
+
+            if len(raw_frames) > target_bytes:
+                raw_frames = raw_frames[:target_bytes]
+            elif len(raw_frames) < target_bytes:
+                raw_frames = raw_frames + b'\x00' * (
+                    target_bytes - len(raw_frames))
+
+            out = _io.BytesIO()
+            with wave.open(out, "wb") as w:
+                w.setnchannels(nch)
+                w.setsampwidth(sw)
+                w.setframerate(orig_fmt["framerate"])
+                w.writeframes(raw_frames)
+            result = out.getvalue()
+
+            orig_dur = target_nframes / orig_fmt["framerate"]
+            repl_dur = repl_nframes / repl_fmt["framerate"]
+            action = "trimmed" if repl_nframes > target_nframes else "padded"
+            self.log(
+                f"  Duration {action}: {repl_dur:.2f}s -> {orig_dur:.2f}s "
+                f"({len(content)} -> {len(result)} bytes)", "success")
+            return result
+        except Exception as e:
+            self.log(f"  WAV resize failed: {e}", "error")
+            return content
+
     # ------------------------------------------------------------------
     # OGG format helpers
     # ------------------------------------------------------------------
@@ -3310,7 +3373,8 @@ class StandaloneModPipeline(ModPipeline):
 
         Reads the original encrypted file from the mounted image, decrypts
         it, compares OGG Vorbis format against the replacement, and converts
-        via ffmpeg if they differ.  Returns (possibly converted) content bytes.
+        via ffmpeg if they differ.  Also matches duration to the original.
+        Returns (possibly converted) content bytes.
         """
         from .audio import (detect_ogg_format, ogg_formats_match,
                             ogg_format_description, ogg_format_diff)
@@ -3333,9 +3397,15 @@ class StandaloneModPipeline(ModPipeline):
                      "info")
             return content
 
+        orig_dec_bytes = orig_fmt.pop("_orig_bytes", None)
+
         if ogg_formats_match(repl_fmt, orig_fmt):
             self.log(f"  OGG format OK: {ogg_format_description(repl_fmt)}",
                      "info")
+            # Format matches but duration might differ — resize if needed
+            if orig_dec_bytes is not None:
+                content = self._resize_ogg_to_duration(
+                    content, orig_fmt, orig_dec_bytes, rel_path)
             return content
 
         diff = ogg_format_diff(repl_fmt, orig_fmt)
@@ -3346,6 +3416,9 @@ class StandaloneModPipeline(ModPipeline):
             self.log(f"  Converted (ffmpeg): "
                      f"{ogg_format_description(repl_fmt)} -> "
                      f"{ogg_format_description(orig_fmt)}", "success")
+            if orig_dec_bytes is not None:
+                converted = self._resize_ogg_to_duration(
+                    converted, orig_fmt, orig_dec_bytes, rel_path)
             return converted
 
         self.log(f"  Warning: could not convert {rel_path} ({diff}). "
@@ -3368,7 +3441,11 @@ class StandaloneModPipeline(ModPipeline):
                     f"base64 '{orig_path}'", timeout=120).strip()
                 orig_enc = _b64.b64decode(enc_b64)
             orig_dec = _df(orig_enc, entry.filler_size, entry.path)
-            return detect_ogg_format(orig_dec)
+            fmt = detect_ogg_format(orig_dec)
+            if fmt is not None:
+                fmt["_orig_size"] = len(orig_dec)
+                fmt["_orig_bytes"] = orig_dec
+            return fmt
         except Exception:
             return None
 
@@ -3437,6 +3514,125 @@ class StandaloneModPipeline(ModPipeline):
                     except OSError:
                         pass
 
+    def _resize_ogg_to_duration(self, content, orig_fmt, orig_dec_bytes,
+                                rel_path):
+        """Trim or pad OGG to match the original's duration using ffmpeg.
+
+        Uses ffprobe to get durations, then ffmpeg to trim or pad.
+        Returns resized OGG bytes, or original content on failure.
+        """
+        import os
+        import tempfile
+        import base64 as _b64
+
+        if not self._ensure_ffmpeg():
+            return content
+
+        tmp_dir = os.environ.get('TEMP', os.environ.get('TMP', '.'))
+        src_tmp = None
+        orig_tmp = None
+        out_tmp = None
+        try:
+            # Write replacement OGG to temp file
+            with tempfile.NamedTemporaryFile(
+                suffix='.ogg', dir=tmp_dir, delete=False
+            ) as tf:
+                tf.write(content)
+                src_tmp = tf.name
+
+            # Write original OGG to temp file for duration probing
+            with tempfile.NamedTemporaryFile(
+                suffix='.ogg', dir=tmp_dir, delete=False
+            ) as tf:
+                tf.write(orig_dec_bytes)
+                orig_tmp = tf.name
+
+            out_tmp = src_tmp + '.resized.ogg'
+
+            src_exec = self.executor.to_exec_path(src_tmp)
+            orig_exec = self.executor.to_exec_path(orig_tmp)
+            out_exec = self.executor.to_exec_path(out_tmp)
+
+            # Get original duration via ffprobe
+            dur_out = self.executor.run(
+                f"ffprobe -v error -show_entries format=duration "
+                f"-of csv=p=0 '{orig_exec}'", timeout=30).strip()
+            orig_dur = float(dur_out)
+
+            # Get replacement duration
+            repl_dur_out = self.executor.run(
+                f"ffprobe -v error -show_entries format=duration "
+                f"-of csv=p=0 '{src_exec}'", timeout=30).strip()
+            repl_dur = float(repl_dur_out)
+
+            if abs(repl_dur - orig_dur) < 0.01:
+                self.log(f"  OGG duration OK: {repl_dur:.2f}s", "info")
+                return content
+
+            bitrate = orig_fmt.get("nominal_bitrate", 112000)
+            if bitrate <= 0:
+                bitrate = 112000
+
+            if repl_dur > orig_dur:
+                # Trim to original duration
+                cmd = (
+                    f"ffmpeg -y -i '{src_exec}' "
+                    f"-t {orig_dur:.6f} "
+                    f"-ar {orig_fmt['sample_rate']} "
+                    f"-ac {orig_fmt['nchannels']} "
+                    f"-c:a libvorbis -b:a {bitrate} "
+                    f"'{out_exec}' 2>&1"
+                )
+            else:
+                # Pad with silence to original duration
+                cmd = (
+                    f"ffmpeg -y -i '{src_exec}' "
+                    f"-af 'apad=whole_dur={orig_dur:.6f}' "
+                    f"-t {orig_dur:.6f} "
+                    f"-ar {orig_fmt['sample_rate']} "
+                    f"-ac {orig_fmt['nchannels']} "
+                    f"-c:a libvorbis -b:a {bitrate} "
+                    f"'{out_exec}' 2>&1"
+                )
+            self.executor.run(cmd, timeout=120)
+
+            # Read result back
+            from .executor import DockerExecutor
+            if isinstance(self.executor, DockerExecutor):
+                enc = self.executor.run(
+                    f"base64 '{out_exec}'", timeout=120).strip()
+                result = _b64.b64decode(enc)
+            else:
+                if os.path.isfile(out_tmp) and os.path.getsize(out_tmp) > 28:
+                    with open(out_tmp, 'rb') as f:
+                        result = f.read()
+                else:
+                    enc = self.executor.run(
+                        f"base64 '{out_exec}'", timeout=120).strip()
+                    result = _b64.b64decode(enc)
+
+            action = "trimmed" if repl_dur > orig_dur else "padded"
+            self.log(
+                f"  OGG duration {action}: {repl_dur:.2f}s -> {orig_dur:.2f}s "
+                f"({len(content)} -> {len(result)} bytes)", "success")
+
+            if len(result) != len(content):
+                self.log(
+                    f"  Note: OGG byte size changed ({len(result)} vs "
+                    f"original {orig_fmt.get('_orig_size', '?')})", "info")
+
+            return result
+        except Exception as e:
+            self.log(f"  OGG resize failed: {e}", "error")
+            return content
+        finally:
+            for p in (src_tmp, orig_tmp, out_tmp):
+                if p:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+
     def _phase_encrypt_standalone(self):
         """Re-encrypt changed files using pure Python crypto.
 
@@ -3478,7 +3674,7 @@ class StandaloneModPipeline(ModPipeline):
             with open(win_path, 'rb') as f:
                 content = f.read()
 
-            # Auto-convert audio files if format doesn't match the original
+            # Auto-convert audio files if format/duration doesn't match
             lower = rel_path.lower()
             if lower.endswith(".wav"):
                 content = self._maybe_convert_audio(
@@ -3486,6 +3682,24 @@ class StandaloneModPipeline(ModPipeline):
             elif lower.endswith(".ogg"):
                 content = self._maybe_convert_ogg(
                     content, entry, None, rel_path)
+
+            # Warn if file size differs from original (any file type)
+            try:
+                orig_stat = self._debugfs_run(
+                    f'stat "{entry.path}"', timeout=15)
+                m = _re.search(r'Size:\s*(\d+)', orig_stat)
+                if m:
+                    orig_enc_size = int(m.group(1))
+                    orig_content_size = orig_enc_size - entry.filler_size - 4
+                    if orig_content_size > 0 and len(content) != orig_content_size:
+                        diff = len(content) - orig_content_size
+                        direction = "larger" if diff > 0 else "smaller"
+                        self.log(
+                            f"  Size: {len(content)} bytes "
+                            f"({abs(diff)} bytes {direction} than "
+                            f"original {orig_content_size})", "info")
+            except Exception:
+                pass  # non-critical — don't fail on size check
 
             self.log(f"Processing: {full_path}", "info")
             self.log(f"  filler={entry.filler_size} "
