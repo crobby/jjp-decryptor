@@ -3871,7 +3871,10 @@ class StandaloneModPipeline(ModPipeline):
                         f"    On disk:  md5={raw_md5[:12]}... size={raw_size}",
                         "error")
 
-            # Decrypt and compare content against the replacement file
+            # Decrypt and compare content against what the encrypt phase wrote.
+            # We use expected['content_md5'] (saved after audio resizing) rather
+            # than re-reading win_path, because the encrypt phase may have
+            # trimmed/padded audio to match original duration.
             if entry and not verification_failed:
                 from .crypto import decrypt_file as _df
                 disk_decrypted = _df(
@@ -3882,10 +3885,14 @@ class StandaloneModPipeline(ModPipeline):
                                 else disk_decrypted)
                 disk_content_md5 = _hl.md5(disk_content).hexdigest()
 
-                with open(win_path, 'rb') as fh:
-                    replacement_md5 = _hl.md5(fh.read()).hexdigest()
+                if expected and 'content_md5' in expected:
+                    expected_content_md5 = expected['content_md5']
+                else:
+                    # Fallback: read the file from disk (pre-audio-resize)
+                    with open(win_path, 'rb') as fh:
+                        expected_content_md5 = _hl.md5(fh.read()).hexdigest()
 
-                if disk_content_md5 == replacement_md5:
+                if disk_content_md5 == expected_content_md5:
                     self.log(
                         f"  Content round-trip verified: {rel_path} "
                         f"(md5={disk_content_md5[:12]}...)",
@@ -3897,10 +3904,10 @@ class StandaloneModPipeline(ModPipeline):
                         f"replacement file!",
                         "error")
                     self.log(
-                        f"    Replacement: md5={replacement_md5[:12]}...",
+                        f"    Expected: md5={expected_content_md5[:12]}...",
                         "error")
                     self.log(
-                        f"    On disk:     md5={disk_content_md5[:12]}...",
+                        f"    On disk:  md5={disk_content_md5[:12]}...",
                         "error")
 
         except Exception as e:
