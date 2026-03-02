@@ -58,9 +58,11 @@ class LinkMsg:
         self.text = text
         self.url = url
 
-class GameDetectedMsg:
-    def __init__(self, name):
-        self.name = name
+class FileTreeMsg:
+    def __init__(self, rel_path, status="Modified", detail=""):
+        self.rel_path = rel_path
+        self.status = status
+        self.detail = detail
 
 
 class App:
@@ -92,11 +94,9 @@ class App:
             on_theme_change=self._on_theme_change,
             initial_theme=saved_theme,
             on_install_prereqs=self._install_prereqs,
+            on_import=self._start_import,
+            on_export=self._start_export,
         )
-
-        # Detect game name when file is selected (register before loading settings
-        # so that restoring a saved image path triggers game detection)
-        self.window.image_var.trace_add("write", self._on_image_changed)
 
         # Load saved settings and pre-populate fields
         self._load_settings()
@@ -208,34 +208,14 @@ class App:
                     self.window.set_progress(
                         msg.current, msg.total, msg.desc,
                         mode=self._active_mode)
-                elif isinstance(msg, GameDetectedMsg):
-                    self.window.set_game_name(msg.name)
+                elif isinstance(msg, FileTreeMsg):
+                    self.window._update_write_tree(
+                        msg.rel_path, msg.status)
                 elif isinstance(msg, DoneMsg):
                     self._on_done(msg.success, msg.summary)
         except queue.Empty:
             pass
         self.root.after(100, self._poll_queue)
-
-    def _on_image_changed(self, *_args):
-        """Try to detect game name from the selected filename."""
-        from .gui import _THEMES
-        path = self.window.image_var.get().strip()
-        gray = _THEMES[self.window._current_theme]["gray"]
-        if not path:
-            self.window.game_label.configure(
-                text="(select an image to detect)", foreground=gray)
-            return
-
-        filename = os.path.basename(path).lower()
-
-        from . import config
-        for key in config.KNOWN_GAMES:
-            if key.lower() in filename:
-                self.window.set_game_name(key)
-                return
-
-        self.window.game_label.configure(
-            text="(will detect when pipeline starts)", foreground=gray)
 
     def _check_prereqs(self):
         """Run prerequisite checks in a background thread."""
@@ -356,23 +336,31 @@ class App:
 
     # --- Create Mods (decrypt) ---
 
-    def _find_fl_dat(self):
-        """Look for a cached fl_decrypted.dat in the output folder."""
+    def _find_fl_dat(self, folder=None):
+        """Look for a cached fl_decrypted.dat in the given or output folder."""
+        paths_to_check = []
+        if folder:
+            paths_to_check.append(folder)
         output_path = self.window.output_var.get().strip()
         if output_path:
-            fl_path = os.path.join(output_path, 'fl_decrypted.dat')
+            paths_to_check.append(output_path)
+        modify_input = self.window.modify_input_var.get().strip()
+        if modify_input:
+            paths_to_check.append(modify_input)
+        write_input = self.window.write_input_var.get().strip()
+        if write_input:
+            paths_to_check.append(write_input)
+        for p in paths_to_check:
+            fl_path = os.path.join(p, 'fl_decrypted.dat')
             if os.path.isfile(fl_path):
                 return fl_path
         return None
 
     def _start(self):
-        """Start the Create Mods action (dispatches based on Create radio)."""
-        source = self.window.get_create_source()
+        """Start the Decrypt action (dispatches based on Decrypt radio)."""
+        source = self.window.get_decrypt_source()
         if source == "ssd":
             self._start_ssd_decrypt()
-            return
-        if source == "export":
-            self._start_export()
             return
 
         # ISO decrypt
@@ -430,14 +418,6 @@ class App:
             image_path, output_path, fl_dat_path,
             log_cb, phase_cb, progress_cb, done_cb,
         )
-        # Intercept game detection
-        orig_detect = self.pipeline._detect_game
-        def patched_detect():
-            orig_detect()
-            if self.pipeline.game_name:
-                self.msg_queue.put(GameDetectedMsg(self.pipeline.game_name))
-        self.pipeline._detect_game = patched_detect
-
         threading.Thread(target=self.pipeline.run, daemon=True).start()
 
     def _start_ssd_decrypt(self):
@@ -470,7 +450,10 @@ class App:
         proceed = messagebox.askyesno(
             "Confirm Device",
             f"You are about to read from:\n\n"
-            f"  {device}\n\n"
+            f"  Model:   {device.model}\n"
+            f"  Size:      {device.size_display}\n"
+            f"  Bus:       {device.bus_type}\n"
+            f"  Device:  {device.device_id}\n\n"
             f"This will mount the drive read-only to decrypt game assets.\n\n"
             f"Continue?")
         if not proceed:
@@ -507,14 +490,6 @@ class App:
             device.device_id, output_path, fl_dat_path,
             log_cb, phase_cb, progress_cb, done_cb,
         )
-        # Intercept game detection
-        orig_detect = self.pipeline._detect_game
-        def patched_detect():
-            orig_detect()
-            if self.pipeline.game_name:
-                self.msg_queue.put(GameDetectedMsg(self.pipeline.game_name))
-        self.pipeline._detect_game = patched_detect
-
         threading.Thread(target=self.pipeline.run, daemon=True).start()
 
     def _cancel(self):
@@ -526,38 +501,35 @@ class App:
     # --- Install Mods (modify / export) ---
 
     def _mod_start(self):
-        """Start the Install Mods action (dispatches based on Install radio)."""
-        method = self.window.get_install_method()
+        """Start the Write action (dispatches based on Write radio)."""
+        method = self.window.get_write_method()
         if method == "ssd":
             self._start_ssd_modify()
             return
-        if method == "import":
-            self._start_import()
-            return
 
-        # ISO modify
-        image_path = self.window.image_var.get().strip()
-        output_path = self.window.output_var.get().strip()
+        # ISO modify — uses Write tab fields
+        output_path = self.window.write_input_var.get().strip()
+        image_path = self.window.write_orig_image_var.get().strip()
 
-        if not image_path:
-            messagebox.showwarning("Missing Input",
-                "Please select a game image file.")
-            return
         if not output_path:
             messagebox.showwarning("Missing Input",
-                "Please select an output folder (containing your modified assets).")
+                "Please select an input folder (containing your modified assets).")
             return
         if not os.path.isdir(output_path):
             messagebox.showerror("Invalid Folder",
-                f"Output folder does not exist:\n{output_path}")
+                f"Input folder does not exist:\n{output_path}")
+            return
+        if not image_path:
+            messagebox.showwarning("Missing Input",
+                "Please select the original game image file.")
             return
 
         checksums_file = os.path.join(output_path, '.checksums.md5')
         if not os.path.isfile(checksums_file):
             messagebox.showerror("No Baseline Checksums",
-                "No .checksums.md5 file found in the output folder.\n\n"
-                "Run Create Mods first to generate baseline checksums, then "
-                "modify files in the output folder and try again.")
+                "No .checksums.md5 file found in the input folder.\n\n"
+                "Decrypt your game first to generate baseline checksums, then "
+                "modify files in the folder and try again.")
             return
 
         if not image_path.lower().endswith(".iso"):
@@ -594,7 +566,7 @@ class App:
             messagebox.showerror(
                 "Missing File List",
                 "No fl_decrypted.dat found in the output folder.\n\n"
-                "Run Create Mods first to generate the file list, then try "
+                "Decrypt your game first to generate the file list, then try "
                 "again.")
             return
 
@@ -606,12 +578,14 @@ class App:
         )
 
         self.pipeline.log_link = lambda text, url: self.msg_queue.put(LinkMsg(text, url))
+        self.pipeline._file_tree_cb = lambda rel_path, status: \
+            self.msg_queue.put(FileTreeMsg(rel_path, status))
         threading.Thread(target=self.pipeline.run, daemon=True).start()
 
     def _start_ssd_modify(self):
         """Start the direct SSD modification pipeline."""
-        device = self.window.get_ssd_device()
-        output_path = self.window.output_var.get().strip()
+        device = self.window.get_write_ssd_device()
+        output_path = self.window.write_input_var.get().strip()
 
         if device is None:
             messagebox.showwarning("No Device",
@@ -620,27 +594,27 @@ class App:
             return
         if not output_path:
             messagebox.showwarning("Missing Input",
-                "Please select an output folder (containing your modified assets).")
+                "Please select an input folder (containing your modified assets).")
             return
         if not os.path.isdir(output_path):
             messagebox.showerror("Invalid Folder",
-                f"Output folder does not exist:\n{output_path}")
+                f"Input folder does not exist:\n{output_path}")
             return
 
         checksums_file = os.path.join(output_path, '.checksums.md5')
         if not os.path.isfile(checksums_file):
             messagebox.showerror("No Baseline Checksums",
-                "No .checksums.md5 file found in the output folder.\n\n"
-                "Run Create Mods first to generate baseline checksums, then "
-                "modify files in the output folder and try again.")
+                "No .checksums.md5 file found in the input folder.\n\n"
+                "Decrypt your game first to generate baseline checksums, then "
+                "modify files and try again.")
             return
 
-        fl_dat_path = self._find_fl_dat()
+        fl_dat_path = self._find_fl_dat(output_path)
         if not fl_dat_path:
             messagebox.showerror(
                 "Missing File List",
                 "No fl_decrypted.dat found in the output folder.\n\n"
-                "Run Create Mods first to generate the file list, then try "
+                "Decrypt your game first to generate the file list, then try "
                 "again.")
             return
 
@@ -648,7 +622,10 @@ class App:
         proceed = messagebox.askyesno(
             "Confirm Direct SSD Modification",
             f"WARNING: You are about to modify files directly on:\n\n"
-            f"  {device}\n\n"
+            f"  Model:   {device.model}\n"
+            f"  Size:      {device.size_display}\n"
+            f"  Bus:       {device.bus_type}\n"
+            f"  Device:  {device.device_id}\n\n"
             f"This writes encrypted files directly to the SSD.\n"
             f"Make sure you have a backup (original Clonezilla ISO).\n\n"
             f"This cannot be undone. Continue?")
@@ -681,16 +658,18 @@ class App:
             log_cb, phase_cb, progress_cb, done_cb,
         )
         self.pipeline.log_link = lambda text, url: self.msg_queue.put(LinkMsg(text, url))
+        self.pipeline._file_tree_cb = lambda rel_path, status: \
+            self.msg_queue.put(FileTreeMsg(rel_path, status))
         threading.Thread(target=self.pipeline.run, daemon=True).start()
 
     def _start_export(self):
-        """Export modified files from the output folder into a shareable zip."""
+        """Export modified files from the mod folder into a shareable zip."""
         from tkinter import filedialog as fd
 
-        output_path = self.window.output_var.get().strip()
+        output_path = self.window.modify_input_var.get().strip()
         if not output_path:
             messagebox.showwarning("Missing Input",
-                "Please select an output folder first.")
+                "Please select a mod folder first.")
             return
         if not os.path.isdir(output_path):
             messagebox.showerror("Invalid Folder",
@@ -701,7 +680,7 @@ class App:
         if not os.path.isfile(checksums_file):
             messagebox.showerror("No Baseline Checksums",
                 "No .checksums.md5 file found in the output folder.\n\n"
-                "Run Create Mods first to generate baseline checksums, then "
+                "Decrypt your game first to generate baseline checksums, then "
                 "modify files and try again.")
             return
 
@@ -709,7 +688,7 @@ class App:
         if not os.path.isfile(fl_dat):
             messagebox.showerror("Missing File List",
                 "No fl_decrypted.dat found in the output folder.\n\n"
-                "Run Create Mods first to generate the file list.")
+                "Decrypt your game first to generate the file list.")
             return
 
         # Try to detect game name for default filename
@@ -753,8 +732,8 @@ class App:
                     f"Contains {num_changed} modified file(s).\n\n"
                     f"Share this zip with other users. They can apply it by:\n"
                     f"1. Decrypting their own game first\n"
-                    f"2. Extracting the zip over their output folder\n"
-                    f"3. Running Install Mods (ISO or SSD)"))
+                    f"2. Importing the mod pack on the Modify tab\n"
+                    f"3. Building a USB ISO or writing to SSD on the Write tab"))
             except Exception as e:
                 self.msg_queue.put(LogMsg(f"Export failed: {e}", "error"))
                 self.root.after(0, lambda: messagebox.showerror(
@@ -763,17 +742,17 @@ class App:
         threading.Thread(target=_run, daemon=True).start()
 
     def _start_import(self):
-        """Import a mod pack ZIP into the output folder."""
+        """Import a mod pack ZIP into the mod folder."""
         from tkinter import filedialog as fd
 
-        output_path = self.window.output_var.get().strip()
+        output_path = self.window.modify_input_var.get().strip()
         if not output_path:
             messagebox.showwarning("Missing Input",
-                "Please select an output folder first.")
+                "Please select an input folder first.")
             return
         if not os.path.isdir(output_path):
             messagebox.showerror("Invalid Folder",
-                f"Output folder does not exist:\n{output_path}")
+                f"Input folder does not exist:\n{output_path}")
             return
 
         zip_path = fd.askopenfilename(
@@ -813,8 +792,8 @@ class App:
                     "Import Complete",
                     f"Imported {num_files} file(s) from:\n"
                     f"{os.path.basename(zip_path)}\n\n"
-                    f"Now use Build USB ISO or Write to SSD to\n"
-                    f"install these mods onto your machine."))
+                    f"Now go to the Write tab and use Build USB ISO\n"
+                    f"or Write to SSD to install these mods."))
             except Exception as e:
                 self.msg_queue.put(LogMsg(f"Import failed: {e}", "error"))
                 self.root.after(0, lambda: messagebox.showerror(
@@ -853,6 +832,11 @@ class App:
                 self.window.image_var.set(settings["image_path"])
             if settings.get("output_path"):
                 self.window.output_var.set(settings["output_path"])
+            # Support both old and new key names for backwards compatibility
+            write_output = (settings.get("write_output_path")
+                            or settings.get("install_output_path"))
+            if write_output:
+                self.window.write_output_var.set(write_output)
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
             pass  # No saved settings yet
 
@@ -865,6 +849,7 @@ class App:
         settings = {
             "image_path": self.window.image_var.get().strip(),
             "output_path": self.window.output_var.get().strip(),
+            "write_output_path": self.window.write_output_var.get().strip(),
             "theme": self.window._current_theme,
         }
         try:

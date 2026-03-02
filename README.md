@@ -8,9 +8,9 @@ JJP pinball machines store encrypted game assets (images, videos, audio, fonts) 
 
 1. **Decrypts** every asset in a game image using a fully reverse-engineered pure Python implementation of the game's custom PRNG and XOR cipher — no dongle or game binary needed
 2. **Re-encrypts** modified assets back into the game image with CRC32 forgery so the game's integrity checks pass without touching the file list
-3. **Produces a bootable Clonezilla ISO** ready to flash onto the machine via USB
-4. **Direct SSD mode** *(experimental)*: Plug the machine's SSD into your computer via a USB enclosure and decrypt/modify files in place — no ISO extraction or rebuilding needed
-5. **Export Mod Pack**: Package your modified files into a shareable zip that other users can apply to their own machines
+3. **Direct SSD mode**: Plug the machine's SSD into your computer via a USB enclosure and decrypt/modify files in place — no ISO extraction or rebuilding needed
+4. **Produces a bootable Clonezilla ISO** ready to flash onto the machine via USB (alternative to direct SSD)
+5. **Mod Packs**: Export your modified files as a shareable zip, or import mod packs from other users
 
 ## Supported Games
 
@@ -27,7 +27,9 @@ JJP pinball machines store encrypted game assets (images, videos, audio, fonts) 
 
 ## Requirements
 
-**Game image**: Clonezilla ISO backup or raw ext4 filesystem image — download "full installs" from https://marketing.jerseyjackpinball.com/downloads/
+**Game source** — one of:
+- **Clonezilla ISO** backup or raw ext4 filesystem image — download "full installs" from https://marketing.jerseyjackpinball.com/downloads/
+- **Direct SSD** — the machine's physical SSD connected via a USB enclosure (see [USB Enclosures](#usb-enclosures-for-direct-ssd-mode) below)
 
 No USB dongle, gcc, or usbipd-win required. No additional Python packages needed (uses only the standard library).
 
@@ -36,6 +38,7 @@ No USB dongle, gcc, or usbipd-win required. No additional Python packages needed
 - **WSL2** with Ubuntu (or similar): `wsl --install`
 - **partclone**, **xorriso**, **e2fsprogs** (provides `debugfs`), **pigz**, and **ffmpeg** in WSL — the app has an **Install Missing** button that installs these automatically, or install manually: `wsl -u root -- apt install partclone xorriso e2fsprogs pigz ffmpeg`
 - **Rufus** (for writing modified ISOs to USB): [rufus.ie](https://rufus.ie/)
+- The app **auto-requests Administrator privileges** on launch (required for WSL disk mounting)
 
 ### macOS
 - **Docker Desktop**: [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/)
@@ -112,80 +115,77 @@ docker run --privileged --rm \
 
 ## Usage
 
-### Decrypting Assets
+The app has three tabs: **Decrypt**, **Write**, and **Mod Pack**.
 
+### Decrypt Tab
+
+Decrypt game assets from a Clonezilla ISO or directly from the machine's SSD.
+
+**From ISO:**
 1. Launch the app
-2. Prerequisites are checked automatically on startup — if anything is missing, click **Install Missing** to fix it
-3. Click **Browse** to select your game image (ISO or ext4)
-4. Click **Browse** to select an output folder for decrypted assets
-5. Click **Start Decryption** — if the output folder already has files, the app will warn you before overwriting
+2. Prerequisites are checked automatically — click **Install Missing** if anything is missing
+3. Select **From ISO** and browse to your game image
+4. Set an output folder for decrypted assets
+5. Click **Start Decryption**
 
-The first run for a game will scan the filesystem and auto-detect filler sizes for every encrypted file. This generates an `fl_decrypted.dat` in the output folder which makes subsequent runs faster. The app remembers your last-used paths between sessions.
+**From SSD (recommended — faster):**
+1. Power off the pinball machine and remove the SSD
+2. Connect the SSD to your computer via a [USB enclosure](#usb-enclosures-for-direct-ssd-mode)
+3. Select **From Game SSD** — the app auto-detects USB drives (internal drives are filtered out for safety)
+4. Select the drive and confirm it's the correct one
+5. Click **Start Decryption** — the drive is mounted read-only
 
-### Modifying Assets
+The first run scans the filesystem and auto-detects filler sizes for every encrypted file, generating `fl_decrypted.dat` in the output folder for faster subsequent runs. The app remembers your last-used paths between sessions.
 
-After decrypting, you can replace game assets and re-encrypt them:
+### Write Tab
 
-1. Switch to the **Modify Assets** tab
-2. Ensure the **Game Image** points to the **original Clonezilla ISO** and the output folder contains your decrypted files
-3. Replace files in the output folder (PNGs, WebMs, OGGs, WAVs, etc.)
-4. Click **Apply Modifications** — the tool detects changed files via checksums, re-encrypts only what changed, forges CRC32 checksums to match the original file list, and builds a new bootable Clonezilla ISO
-5. The output `<name>_modified.iso` is saved to your output folder
+After decrypting, replace game assets in the output folder (PNGs, WebMs, OGGs, WAVs, etc.) and write them back. The Write tab shows a preview of all modified files before writing.
 
-### Installing on the Machine
+**Write to SSD (recommended — instant):**
+1. Select **Write to Game SSD** and pick the USB-connected drive
+2. Review the modified files in the preview tree
+3. Click **Start** — the tool encrypts changed files with CRC32 forgery and writes them directly to the SSD
+4. Put the SSD back in the machine — no USB flashing needed
 
-1. Write the `_modified.iso` to a USB drive:
+**Build USB ISO (traditional):**
+1. Select **Build USB ISO** and browse to the **original Clonezilla ISO**
+2. Click **Start** — the tool builds a new bootable ISO with your modifications
+3. Write the `_modified.iso` to a USB drive:
    - **Windows**: Use [Rufus](https://rufus.ie/) — **select ISO mode (not DD mode)** when prompted
    - **macOS/Linux**: Use [balenaEtcher](https://etcher.balena.io/) or `dd`
-2. Boot the pinball machine from the USB drive
-3. Clonezilla restores the image automatically
+4. Boot the pinball machine from the USB drive — Clonezilla restores the image automatically
 
-Detailed instructions: [Windows (PDF)](https://marketing.jerseyjackpinball.com/general/install-full/JJP_USB_UPDATE_PC_instructions.pdf) | [Mac (PDF)](https://marketing.jerseyjackpinball.com/general/install-full/JJP_USB_UPDATE_MAC_instructions.pdf)
+Detailed flashing instructions: [Windows (PDF)](https://marketing.jerseyjackpinball.com/general/install-full/JJP_USB_UPDATE_PC_instructions.pdf) | [Mac (PDF)](https://marketing.jerseyjackpinball.com/general/install-full/JJP_USB_UPDATE_MAC_instructions.pdf)
 
-### Direct SSD Mode (Experimental)
+### Mod Pack Tab
 
-Instead of going through the ISO workflow, you can plug the machine's SATA SSD directly into your computer via a USB-to-SATA enclosure and decrypt or modify files in place. This eliminates the ~30-minute ISO extract/rebuild cycle.
+Share modifications with other users without sharing entire game images.
 
-**What you need:**
-- A **USB-to-SATA enclosure** or adapter (the JJP SSD is a standard 2.5" SATA drive)
-- **Administrator privileges** (Windows requires admin for `wsl --mount`)
+**Export a mod pack:**
+1. Decrypt the game and modify files in the output folder
+2. Switch to the **Mod Pack** tab and click **Export Mod Pack**
+3. Choose a save location — the zip contains only modified files plus metadata
 
-**To decrypt from SSD:**
-1. Power off the pinball machine and remove the SSD
-2. Connect the SSD to your computer via the USB enclosure
-3. Switch to the **Direct SSD** tab
-4. Click **Refresh** to detect the drive, then select it from the dropdown
-5. Set the output folder on the Decrypt tab
-6. Click **Decrypt from SSD** — the drive is mounted read-only
+**Import a mod pack:**
+1. Decrypt your own game first (from ISO or SSD) to create the output folder
+2. Click **Import Mod Pack** and select the zip
+3. Use the **Write** tab to write the changes to SSD or build a USB ISO
 
-**To apply mods to SSD:**
-1. Decrypt the game first (from SSD or ISO) to get the output folder with `fl_decrypted.dat` and `.checksums.md5`
-2. Modify files in the output folder
-3. Connect the SSD via USB enclosure
-4. Click **Apply Mods to SSD** — the tool mounts read-write, encrypts changed files directly to the SSD, syncs, unmounts, and runs `e2fsck`
-5. Put the SSD back in the machine and power on — no USB flashing needed
+Mod packs are small (only changed files) and game-specific. They work across machines running the same game.
+
+### USB Enclosures for Direct SSD Mode
+
+The machine's SSD connects to your computer via a USB enclosure. The app only shows USB-connected external drives (internal drives are filtered out for safety). You'll need one of these depending on your SSD type:
+
+- **SATA SSD** (most JJP machines): [USB-to-SATA enclosure](https://a.co/d/0aTa0PdC) — standard 2.5" SATA
+- **NVMe SSD** (newer machines): [USB-to-NVMe enclosure](https://a.co/d/0ej7sNtG)
 
 **Platform details:**
-- **Windows**: Uses `wsl --mount \\.\PHYSICALDRIVE<N> --partition 3 --type ext4`. Requires WSL2 and admin privileges.
+- **Windows**: Uses `wsl --mount`. The app auto-requests Administrator privileges on launch.
 - **macOS**: Uses Docker with `--device` passthrough. Requires Docker Desktop.
 - **Linux**: Uses native `mount -t ext4`. Requires root.
 
-> **Note**: This feature is experimental. Always keep your original Clonezilla ISO as a backup. The tool validates that the SSD contains a JJP game partition before proceeding.
-
-### Exporting and Sharing Mod Packs
-
-After modifying files, you can package just the changed files into a shareable zip:
-
-1. Decrypt the game and modify files in the output folder
-2. Switch to the **Direct SSD** tab and click **Export Mod Pack**
-3. Choose a save location — the zip contains only modified files plus `fl_decrypted.dat` and `.checksums.md5`
-
-**To apply a mod pack you received:**
-1. Decrypt your own game first (from ISO or SSD) to create the output folder
-2. Extract the mod pack zip over the output folder (replacing files)
-3. Run **Apply Modifications** (ISO workflow) or **Apply Mods to SSD** (direct SSD)
-
-Mod packs are small (only changed files) and game-specific. They work across machines running the same game.
+> Always keep your original Clonezilla ISO as a backup. The tool validates that the SSD contains a JJP game partition before proceeding.
 
 ### File Format Notes
 
@@ -227,17 +227,18 @@ Video files are not auto-converted because resolution changes are creative decis
 
 ```
 jjp_decryptor/
-├── __main__.py      # GUI entry point (python -m jjp_decryptor)
+├── __main__.py      # GUI entry point (python -m jjp_decryptor), auto-elevates to admin on Windows
 ├── cli.py           # CLI entry point for Docker/headless use (python -m jjp_decryptor.cli)
 ├── app.py           # Application controller — wires GUI ↔ pipeline via thread-safe queue
-├── gui.py           # Tkinter GUI with dark/light theme, tabs, progress tracking
-├── pipeline.py      # Standalone, Direct SSD, and ISO pipelines + mod pack export
-├── audio.py         # WAV format detection and pure Python audio conversion
+├── gui.py           # Tkinter GUI with dark/light theme, 3 tabs (Decrypt/Write/Mod Pack)
+├── pipeline.py      # Standalone, Direct SSD, and ISO pipelines + mod pack export/import
+├── audio.py         # WAV/OGG format detection and pure Python audio conversion
 ├── crypto.py        # Pure Python PRNG, XOR cipher, filler detection, CRC32 forgery
 ├── filelist.py      # fl.dat parser/generator and filesystem scanner
+├── guide.py         # Audio guide generator — scans game folders and produces structured summaries
 ├── resources.py     # Embedded C sources (legacy dongle-based hooks, kept for reference)
 ├── config.py        # Constants (paths, timeouts, known games, phase names)
-├── executor.py      # Platform-aware command executor (WSL/Docker/Native)
+├── executor.py      # Platform-aware command executor (WSL/Docker/Native) + USB drive detection
 ├── wsl.py           # Backward-compat wrapper (imports from executor.py)
 └── updater.py       # Auto-update checker (GitHub releases API)
 ```
@@ -295,7 +296,7 @@ flowchart LR
     FLASH --> MACHINE[Pinball Machine]
 ```
 
-**Direct SSD Workflow** (experimental — no ISO needed):
+**Direct SSD Workflow** (recommended — no ISO needed):
 ```mermaid
 flowchart LR
     subgraph Your PC
@@ -390,17 +391,17 @@ flowchart TD
 
     B -.- B1["Compare output folder against .checksums.md5"]
     C -.- C1["Mount SSD partition 3 read-write"]
-    D -.- D1["Same as ISO encrypt:\nAuto-convert audio, encrypt, forge CRC32\nWrite directly to SSD"]
-    E -.- E1["Sync → unmount → e2fsck -fy"]
+    D -.- D1["Auto-convert audio, encrypt, forge CRC32\ncp encrypted files to mounted SSD\nSync to disk"]
+    E -.- E1["Sync → unmount → bring disk online"]
 ```
 
 | Phase | What Happens |
 |-------|-------------|
-| **Mount** | Platform-aware mount of SSD partition 3 (ext4). Read-only for decrypt, read-write for modify. Validates `/jjpe/gen1/` exists |
+| **Mount** | Platform-aware mount of SSD partition 3 (ext4). Read-only for decrypt, read-write for modify. On Windows: takes disk offline, clears stale WSL mounts, attaches via `wsl --mount`, validates `/jjpe/gen1/` exists |
 | **Decrypt** | Identical to ISO decrypt — scans, detects fillers, XOR-decrypts to output folder |
 | **Scan** | Same checksum comparison as ISO modify — finds changed files |
-| **Encrypt** | Same pure Python encryption with CRC32 forgery — writes encrypted files directly to the SSD |
-| **Cleanup** | Syncs filesystem, unmounts SSD, runs `e2fsck -fy` (modify only) |
+| **Encrypt** | Pure Python encryption with CRC32 forgery — copies encrypted files directly to the mounted SSD filesystem |
+| **Cleanup** | Syncs filesystem, detaches SSD from WSL, brings disk back online for safe ejection |
 
 ## Troubleshooting
 

@@ -1,12 +1,27 @@
 """Main window GUI for JJP Asset Decryptor."""
 
+import os
 import sys
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog
 import time
 import webbrowser
 
 from . import config
+
+
+def _is_admin():
+    """Check whether the current process has Administrator privileges."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    else:
+        import os
+        return os.geteuid() == 0
 
 
 def _platform_font():
@@ -96,12 +111,13 @@ class _Tooltip:
 
 
 class MainWindow:
-    """Single-window tkinter GUI with Create Mods and Install Mods tabs."""
+    """Single-window tkinter GUI with Decrypt, Modify, and Write tabs."""
 
     def __init__(self, root, on_check_prereqs, on_start, on_cancel,
                  on_mod_apply=None, on_mod_cancel=None, on_clear_cache=None,
                  on_theme_change=None, initial_theme=None,
-                 on_install_prereqs=None):
+                 on_install_prereqs=None,
+                 on_import=None, on_export=None):
         self.root = root
         self._on_check_prereqs = on_check_prereqs
         self._on_start = on_start
@@ -111,6 +127,8 @@ class MainWindow:
         self._on_clear_cache = on_clear_cache
         self._on_theme_change = on_theme_change
         self._on_install_prereqs = on_install_prereqs
+        self._on_import = on_import
+        self._on_export = on_export
 
         # Title is set by App (includes version); fallback here for standalone use
         if not root.title():
@@ -220,6 +238,19 @@ class MainWindow:
                          foreground=c["error"], **_icon_base)
         style.map("Trash.TButton", background=[("active", c["button"])])
         style.configure("TEntry", fieldbackground=c["field_bg"], foreground=c["fg"])
+        style.configure("TCombobox", fieldbackground=c["field_bg"],
+                         foreground=c["fg"], background=c["button"],
+                         selectbackground=c["select_bg"],
+                         selectforeground="#ffffff")
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", c["field_bg"])],
+                  foreground=[("readonly", c["fg"])],
+                  background=[("readonly", c["button"])])
+        # Style the dropdown listbox (not reachable via ttk.Style)
+        self.root.option_add("*TCombobox*Listbox.background", c["field_bg"])
+        self.root.option_add("*TCombobox*Listbox.foreground", c["fg"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", c["select_bg"])
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
         style.configure("TNotebook", background=c["bg"], bordercolor=c["border"])
         style.configure("TNotebook.Tab", background=c["bg"], foreground=c["fg"],
                          padding=[8, 4])
@@ -238,6 +269,16 @@ class MainWindow:
                          bordercolor=c["border"])
         style.map("Vertical.TScrollbar",
                   background=[("active", c["accent"])])
+        style.configure("Treeview",
+                         background=c["field_bg"], foreground=c["fg"],
+                         fieldbackground=c["field_bg"],
+                         bordercolor=c["border"])
+        style.map("Treeview",
+                  background=[("selected", c["select_bg"])],
+                  foreground=[("selected", "#ffffff")])
+        style.configure("Treeview.Heading",
+                         background=c["button"], foreground=c["fg"],
+                         bordercolor=c["border"])
 
         # Root window
         self.root.configure(bg=c["bg"])
@@ -268,13 +309,6 @@ class MainWindow:
         self.log_text.tag_configure("timestamp", foreground=d["timestamp"])
         self.log_text.tag_configure("link", foreground=d["link"], underline=True)
 
-        # Game label - preserve state
-        game_text = self.game_label.cget("text")
-        if game_text.startswith("("):
-            self.game_label.configure(foreground=c["gray"])
-        else:
-            self.game_label.configure(foreground=c["fg"])
-
         # Re-apply prereq indicator colors
         for name, passed in self._prereq_state.items():
             label = self.prereq_labels.get(name)
@@ -283,14 +317,32 @@ class MainWindow:
                     foreground=c["success"] if passed else c["error"])
 
         # SSD warning labels
-        for w in (self._create_ssd_warning, self._install_ssd_warning):
+        for w in (self._decrypt_ssd_warning, self._write_ssd_warning,
+                  self._decrypt_admin_warning, self._write_admin_warning):
             w.configure(foreground=c["error"])
 
         # Description labels
-        for w in (self._create_desc, self._create_ssd_desc,
-                  self._create_export_desc, self._install_desc,
-                  self._install_ssd_desc, self._install_import_desc):
+        for w in (self._decrypt_desc, self._decrypt_ssd_desc,
+                  self._modify_desc, self._write_desc,
+                  self._write_ssd_desc):
             w.configure(foreground=c["gray"])
+
+        # File tree tag colors
+        for tree in [getattr(self, 'write_tree', None)]:
+            if tree is None:
+                continue
+            tree.tag_configure("modified",
+                foreground=c.get("accent", "#1976D2"))
+            tree.tag_configure("ok",
+                foreground=c.get("success", "#2E7D32"))
+            tree.tag_configure("trimmed",
+                foreground="#E65100" if theme == "light" else "#FF9800")
+            tree.tag_configure("padded",
+                foreground="#1565C0" if theme == "light" else "#64B5F6")
+            tree.tag_configure("converted",
+                foreground="#6A1B9A" if theme == "light" else "#CE93D8")
+            tree.tag_configure("warning",
+                foreground=c.get("error", "#C62828"))
 
         # Theme toggle button: yellow sun / blue moon
         if theme == "dark":
@@ -332,7 +384,6 @@ class MainWindow:
         self.clear_cache_btn.pack(side=tk.RIGHT, padx=(0, 4))
         _Tooltip(self.clear_cache_btn, "Clear cached images", lambda: self._current_theme)
 
-        self._build_config(main)
         self._build_prerequisites(main)
 
         # --- Notebook (tabs) ---
@@ -343,13 +394,17 @@ class MainWindow:
         self.notebook = ttk.Notebook(main)
         self.notebook.pack(fill=tk.X, pady=(0, 4))
 
-        create_frame = ttk.Frame(self.notebook, padding=6)
-        self.notebook.add(create_frame, text=" Create Mods ")
-        self._build_create_tab(create_frame)
+        decrypt_frame = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(decrypt_frame, text=" Decrypt ")
+        self._build_decrypt_tab(decrypt_frame)
 
-        install_frame = ttk.Frame(self.notebook, padding=6)
-        self.notebook.add(install_frame, text=" Install Mods ")
-        self._build_install_tab(install_frame)
+        write_frame = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(write_frame, text=" Write ")
+        self._build_write_tab(write_frame)
+
+        modpack_frame = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(modpack_frame, text=" Mod Pack ")
+        self._build_modpack_tab(modpack_frame)
 
         # Resize notebook to fit current tab on switch
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -357,47 +412,6 @@ class MainWindow:
 
         # --- Log Output (fills remaining space) ---
         self._build_log(main)
-
-    def _build_config(self, parent):
-        cfg_frame = ttk.LabelFrame(parent, text=" Configuration ", padding=6)
-        cfg_frame.pack(fill=tk.X, pady=(0, 4))
-
-        # Image file
-        row = ttk.Frame(cfg_frame)
-        row.pack(fill=tk.X, pady=2)
-        ttk.Label(row, text="Game Image:", width=18, anchor=tk.W).pack(side=tk.LEFT)
-        self.image_var = tk.StringVar()
-        self.image_entry = ttk.Entry(row, textvariable=self.image_var)
-        self.image_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        ttk.Button(row, text="Browse...", command=self._browse_image, width=10).pack(side=tk.LEFT)
-
-        # Game SSD device selector
-        row = ttk.Frame(cfg_frame)
-        row.pack(fill=tk.X, pady=2)
-        ttk.Label(row, text="Game SSD:", width=18, anchor=tk.W).pack(side=tk.LEFT)
-        self.ssd_device_var = tk.StringVar()
-        self.ssd_device_combo = ttk.Combobox(
-            row, textvariable=self.ssd_device_var,
-            state="readonly")
-        self.ssd_device_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        ttk.Button(row, text="Refresh",
-                   command=self._ssd_refresh_devices, width=10).pack(side=tk.LEFT)
-
-        # Output folder
-        row = ttk.Frame(cfg_frame)
-        row.pack(fill=tk.X, pady=2)
-        ttk.Label(row, text="Output Folder:", width=18, anchor=tk.W).pack(side=tk.LEFT)
-        self.output_var = tk.StringVar()
-        self.output_entry = ttk.Entry(row, textvariable=self.output_var)
-        self.output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        ttk.Button(row, text="Browse...", command=self._browse_output, width=10).pack(side=tk.LEFT)
-
-        # Detected game
-        row = ttk.Frame(cfg_frame)
-        row.pack(fill=tk.X, pady=2)
-        ttk.Label(row, text="Detected Game:", width=18, anchor=tk.W).pack(side=tk.LEFT)
-        self.game_label = ttk.Label(row, text="(select an image to detect)", foreground="gray")
-        self.game_label.pack(side=tk.LEFT)
 
     def _build_prerequisites(self, parent):
         prereq_frame = ttk.LabelFrame(parent, text=" Prerequisites ", padding=6)
@@ -409,287 +423,505 @@ class MainWindow:
         self.prereq_labels = {}
         prereq_names = config.PREREQ_NAMES
         for i, name in enumerate(prereq_names):
-            col = i % 2
-            row_idx = i // 2
+            col = i % 6
+            row_idx = i // 6
             frame = ttk.Frame(self.prereq_grid)
-            frame.grid(row=row_idx, column=col, sticky=tk.W, padx=(0, 20), pady=1)
+            frame.grid(row=row_idx, column=col, sticky=tk.W, padx=(0, 12), pady=1)
             indicator = ttk.Label(frame, text="[ ? ]", foreground="gray", width=5)
             indicator.pack(side=tk.LEFT)
             ttk.Label(frame, text=name).pack(side=tk.LEFT)
             self.prereq_labels[name] = indicator
 
-        btn_row = ttk.Frame(prereq_frame)
-        btn_row.pack(pady=(6, 0))
-        self.check_btn = ttk.Button(btn_row, text="Check Prerequisites",
+        btn_frame = ttk.Frame(self.prereq_grid)
+        btn_frame.grid(row=0, column=len(prereq_names), sticky=tk.E,
+                        padx=(12, 0))
+        self.check_btn = ttk.Button(btn_frame, text="Check",
                                      command=self._on_check_prereqs)
-        self.check_btn.pack(side=tk.LEFT, padx=4)
-        self.install_btn = ttk.Button(btn_row, text="Install Missing",
+        self.check_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.install_btn = ttk.Button(btn_frame, text="Install Missing",
                                        command=self._on_install_prereqs,
                                        state=tk.DISABLED)
-        self.install_btn.pack(side=tk.LEFT, padx=4)
+        self.install_btn.pack(side=tk.LEFT)
+        self.prereq_grid.columnconfigure(len(prereq_names), weight=1)
 
     # ------------------------------------------------------------------
-    # Create Mods tab
+    # Decrypt tab
     # ------------------------------------------------------------------
 
-    def _build_create_tab(self, parent):
+    def _build_decrypt_tab(self, parent):
         c = _THEMES[self._current_theme]
 
-        # Radio toggle: From Game ISO / From Game SSD / Export Mod Pack
+        # Radio toggle: From ISO / From SSD
         radio_row = ttk.Frame(parent)
         radio_row.pack(fill=tk.X, pady=(0, 6))
-        self._create_source_var = tk.StringVar(value="iso")
-        ttk.Radiobutton(radio_row, text="Decrypt from ISO",
-                        variable=self._create_source_var, value="iso"
+        self._decrypt_source_var = tk.StringVar(value="iso")
+        ttk.Radiobutton(radio_row, text="From ISO",
+                        variable=self._decrypt_source_var, value="iso"
                         ).pack(side=tk.LEFT, padx=(0, 16))
-        ttk.Radiobutton(radio_row, text="Decrypt from SSD",
-                        variable=self._create_source_var, value="ssd"
-                        ).pack(side=tk.LEFT, padx=(0, 16))
-        ttk.Radiobutton(radio_row, text="Export Mod Pack",
-                        variable=self._create_source_var, value="export"
+        ttk.Radiobutton(radio_row, text="From SSD",
+                        variable=self._decrypt_source_var, value="ssd"
                         ).pack(side=tk.LEFT)
 
-        # Conditional content area — swap children inside this stable container
-        self._create_content_area = ttk.Frame(parent)
-        self._create_content_area.pack(fill=tk.X)
+        # --- Per-tab config fields ---
+        cfg_frame = ttk.LabelFrame(parent, text=" Configuration ", padding=6)
+        cfg_frame.pack(fill=tk.X, pady=(0, 6))
 
-        self._create_iso_frame = ttk.Frame(self._create_content_area)
-        self._create_ssd_frame = ttk.Frame(self._create_content_area)
-        self._create_export_frame = ttk.Frame(self._create_content_area)
+        _tf = lambda: self._current_theme
+
+        # Game Image (ISO mode)
+        self._decrypt_image_row = ttk.Frame(cfg_frame)
+        self._decrypt_image_row.pack(fill=tk.X, pady=2)
+        lbl = ttk.Label(self._decrypt_image_row, text="Game Image:", width=20,
+                        anchor=tk.W)
+        lbl.pack(side=tk.LEFT)
+        _Tooltip(lbl, "Clonezilla ISO or raw ext4 image \u2014 download "
+                 "full installs from marketing.jerseyjackpinball.com/downloads/", _tf)
+        self.image_var = tk.StringVar()
+        self.image_entry = ttk.Entry(self._decrypt_image_row,
+                                      textvariable=self.image_var)
+        self.image_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        ttk.Button(self._decrypt_image_row, text="Browse...",
+                   command=self._browse_image, width=10).pack(side=tk.LEFT)
+
+        # Game SSD (SSD mode)
+        self._decrypt_ssd_row = ttk.Frame(cfg_frame)
+        lbl = ttk.Label(self._decrypt_ssd_row, text="Game SSD:", width=20,
+                        anchor=tk.W)
+        lbl.pack(side=tk.LEFT)
+        _Tooltip(lbl, "The JJP game SSD connected via USB enclosure", _tf)
+        self.ssd_device_var = tk.StringVar()
+        self.ssd_device_combo = ttk.Combobox(
+            self._decrypt_ssd_row, textvariable=self.ssd_device_var,
+            state="readonly")
+        self.ssd_device_combo.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                    padx=(0, 4))
+        self.ssd_device_combo.bind(
+            "<<ComboboxSelected>>", self._on_ssd_device_selected)
+        ttk.Button(self._decrypt_ssd_row, text="Refresh",
+                   command=self._ssd_refresh_devices, width=10).pack(side=tk.LEFT)
+
+        # Output Folder
+        self._decrypt_output_row = ttk.Frame(cfg_frame)
+        self._decrypt_output_row.pack(fill=tk.X, pady=2)
+        lbl = ttk.Label(self._decrypt_output_row, text="Output Folder:", width=20,
+                        anchor=tk.W)
+        lbl.pack(side=tk.LEFT)
+        _Tooltip(lbl, "Where decrypted game files will be saved \u2014 "
+                 "you'll edit files here", _tf)
+        self.output_var = tk.StringVar()
+        self.output_entry = ttk.Entry(self._decrypt_output_row,
+                                       textvariable=self.output_var)
+        self.output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        ttk.Button(self._decrypt_output_row, text="Browse...",
+                   command=self._browse_output, width=10).pack(side=tk.LEFT)
+
+        self._decrypt_cfg_frame = cfg_frame
+
+        # Conditional content area
+        self._decrypt_content_area = ttk.Frame(parent)
+        self._decrypt_content_area.pack(fill=tk.X)
+
+        self._decrypt_iso_frame = ttk.Frame(self._decrypt_content_area)
+        self._decrypt_ssd_frame = ttk.Frame(self._decrypt_content_area)
 
         # ISO sub-section (initially shown)
-        self._create_desc = ttk.Label(
-            self._create_iso_frame,
+        self._decrypt_desc = ttk.Label(
+            self._decrypt_iso_frame,
             text="Decrypt game assets from an ISO image to editable "
                  "files in your Output Folder.",
             foreground=c["gray"], wraplength=700, justify=tk.LEFT)
-        self._create_desc.pack(anchor=tk.W, pady=(0, 6))
+        self._decrypt_desc.pack(anchor=tk.W, pady=(0, 6))
 
         # SSD sub-section
-        self._create_ssd_warning = ttk.Label(
-            self._create_ssd_frame,
+        self._decrypt_ssd_warning = ttk.Label(
+            self._decrypt_ssd_frame,
             text=("\u26A0  Remove the SSD from the pinball machine before "
                   "connecting. Always keep the original ISO as a backup."),
             foreground=c["error"], wraplength=700, justify=tk.LEFT)
-        self._create_ssd_warning.pack(anchor=tk.W, pady=(0, 6))
+        self._decrypt_ssd_warning.pack(anchor=tk.W, pady=(0, 6))
 
-        self._create_ssd_desc = ttk.Label(
-            self._create_ssd_frame,
+        self._decrypt_admin_warning = ttk.Label(
+            self._decrypt_ssd_frame,
+            text="\u26A0  SSD mode requires Run as Administrator "
+                 "(right-click the app \u2192 Run as administrator).",
+            foreground=c["error"], wraplength=700, justify=tk.LEFT)
+        if not _is_admin():
+            self._decrypt_admin_warning.pack(anchor=tk.W, pady=(0, 6))
+
+        self._decrypt_ssd_desc = ttk.Label(
+            self._decrypt_ssd_frame,
             text="Decrypt game assets directly from the SSD to editable "
                  "files in your Output Folder.",
             foreground=c["gray"], wraplength=700, justify=tk.LEFT)
-        self._create_ssd_desc.pack(anchor=tk.W, pady=(0, 6))
-
-        # Export sub-section
-        self._create_export_desc = ttk.Label(
-            self._create_export_frame,
-            text="Package your modified files into a shareable ZIP that "
-                 "others can apply to their own game.",
-            foreground=c["gray"], wraplength=700, justify=tk.LEFT)
-        self._create_export_desc.pack(anchor=tk.W, pady=(0, 6))
+        self._decrypt_ssd_desc.pack(anchor=tk.W, pady=(0, 6))
 
         # Show ISO frame initially
-        self._create_iso_frame.pack(fill=tk.X, in_=self._create_content_area)
+        self._decrypt_iso_frame.pack(fill=tk.X, in_=self._decrypt_content_area)
 
-        # Shared widgets (below the conditional frames)
-        self._create_step_row = ttk.Frame(parent)
-        self._create_step_row.pack(fill=tk.X, pady=(0, 6))
-        self.create_step_labels = []
-        self._build_step_labels(self._create_step_row, config.STANDALONE_PHASES,
-                                self.create_step_labels)
+        # Step indicators
+        self._decrypt_step_row = ttk.Frame(parent)
+        self._decrypt_step_row.pack(fill=tk.X, pady=(0, 6))
+        self.decrypt_step_labels = []
+        self._build_step_labels(self._decrypt_step_row, config.STANDALONE_PHASES,
+                                self.decrypt_step_labels)
 
+        # Progress bar
         prog_row = ttk.Frame(parent)
         prog_row.pack(fill=tk.X, pady=(0, 6))
-        self.create_progress_label = ttk.Label(prog_row, text="", anchor=tk.E)
-        self.create_progress_label.pack(side=tk.RIGHT)
-        self.create_progress = ttk.Progressbar(prog_row, mode="determinate")
-        self.create_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.decrypt_progress_label = ttk.Label(prog_row, text="", anchor=tk.E)
+        self.decrypt_progress_label.pack(side=tk.RIGHT)
+        self.decrypt_progress = ttk.Progressbar(prog_row, mode="determinate")
+        self.decrypt_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
 
+        # Buttons
         btn_row = ttk.Frame(parent)
         btn_row.pack()
-        self.create_start_btn = ttk.Button(btn_row, text="Start Decryption",
-                                            command=self._on_start)
-        self.create_start_btn.pack(side=tk.LEFT, padx=4)
-        self.create_cancel_btn = ttk.Button(btn_row, text="Cancel",
-                                             command=self._on_cancel,
-                                             state=tk.DISABLED)
-        self.create_cancel_btn.pack(side=tk.LEFT, padx=4)
+        self.decrypt_start_btn = ttk.Button(btn_row, text="Start Decryption",
+                                             command=self._on_start)
+        self.decrypt_start_btn.pack(side=tk.LEFT, padx=4)
+        self.decrypt_cancel_btn = ttk.Button(btn_row, text="Cancel",
+                                              command=self._on_cancel,
+                                              state=tk.DISABLED)
+        self.decrypt_cancel_btn.pack(side=tk.LEFT, padx=4)
 
         # Bind radio changes
-        self._create_source_var.trace_add("write", self._on_create_source_changed)
+        self._decrypt_source_var.trace_add("write", self._on_decrypt_source_changed)
 
-    def _on_create_source_changed(self, *_args):
-        """Show/hide widgets when Create Mods source radio changes."""
-        source = self._create_source_var.get()
-        self._create_iso_frame.pack_forget()
-        self._create_ssd_frame.pack_forget()
-        self._create_export_frame.pack_forget()
+    def _on_decrypt_source_changed(self, *_args):
+        """Show/hide widgets when Decrypt source radio changes."""
+        source = self._decrypt_source_var.get()
+        self._decrypt_iso_frame.pack_forget()
+        self._decrypt_ssd_frame.pack_forget()
+
+        # Show/hide config rows based on mode
+        self._decrypt_image_row.pack_forget()
+        self._decrypt_ssd_row.pack_forget()
+        self._decrypt_output_row.pack_forget()
 
         if source == "iso":
-            self._create_iso_frame.pack(fill=tk.X,
-                in_=self._create_content_area)
+            self._decrypt_image_row.pack(fill=tk.X, pady=2,
+                in_=self._decrypt_cfg_frame)
+            self._decrypt_output_row.pack(fill=tk.X, pady=2,
+                in_=self._decrypt_cfg_frame)
+            self._decrypt_iso_frame.pack(fill=tk.X,
+                in_=self._decrypt_content_area)
             phases = config.STANDALONE_PHASES
-            self._create_step_row.pack(fill=tk.X, pady=(0, 6))
-            self.create_start_btn.configure(text="Start Decryption")
-            self.create_cancel_btn.pack(side=tk.LEFT, padx=4)
-        elif source == "ssd":
-            self._create_ssd_frame.pack(fill=tk.X,
-                in_=self._create_content_area)
+        else:  # ssd
+            self._decrypt_ssd_row.pack(fill=tk.X, pady=2,
+                in_=self._decrypt_cfg_frame)
+            self._decrypt_output_row.pack(fill=tk.X, pady=2,
+                in_=self._decrypt_cfg_frame)
+            self._decrypt_ssd_frame.pack(fill=tk.X,
+                in_=self._decrypt_content_area)
             phases = config.DIRECT_SSD_PHASES
-            self._create_step_row.pack(fill=tk.X, pady=(0, 6))
-            self.create_start_btn.configure(text="Start Decryption")
-            self.create_cancel_btn.pack(side=tk.LEFT, padx=4)
-        else:  # export
-            self._create_export_frame.pack(fill=tk.X,
-                in_=self._create_content_area)
-            phases = []
-            self._create_step_row.pack_forget()
-            self.create_start_btn.configure(text="Export Mod Pack")
-            self.create_cancel_btn.pack_forget()
+            # Auto-refresh device list when switching to SSD mode
+            if not getattr(self, '_ssd_devices', None):
+                self._ssd_refresh_devices()
 
-        if phases:
-            self._build_step_labels(self._create_step_row, phases,
-                                    self.create_step_labels)
-        else:
-            for w in self._create_step_row.winfo_children():
-                w.destroy()
-            self.create_step_labels.clear()
+        self._build_step_labels(self._decrypt_step_row, phases,
+                                self.decrypt_step_labels)
 
         # Re-fit notebook height
         self._on_tab_changed()
 
     # ------------------------------------------------------------------
-    # Install Mods tab
+    # Modify tab
     # ------------------------------------------------------------------
 
-    def _build_install_tab(self, parent):
+    def _build_modpack_tab(self, parent):
         c = _THEMES[self._current_theme]
 
-        # Radio toggle: Build USB ISO / Write to SSD / Import Mod Pack
+        # --- Config: Input Folder ---
+        cfg_frame = ttk.LabelFrame(parent, text=" Configuration ", padding=6)
+        cfg_frame.pack(fill=tk.X, pady=(0, 6))
+
+        _tf = lambda: self._current_theme
+
+        input_row = ttk.Frame(cfg_frame)
+        input_row.pack(fill=tk.X, pady=2)
+        lbl = ttk.Label(input_row, text="Game Assets:", width=20, anchor=tk.W)
+        lbl.pack(side=tk.LEFT)
+        _Tooltip(lbl, "Folder containing decrypted game files "
+                 "(set automatically by the Decrypt tab)", _tf)
+        self.modify_input_var = self.output_var  # same folder as Decrypt output
+        self.modify_input_entry = ttk.Entry(input_row,
+                                             textvariable=self.modify_input_var)
+        self.modify_input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                      padx=(0, 4))
+        ttk.Button(input_row, text="Browse...",
+                   command=self._browse_modify_input, width=10).pack(side=tk.LEFT)
+
+        self._modify_desc = ttk.Label(
+            parent,
+            text="Export your modified files as a shareable mod pack ZIP, "
+                 "or import a mod pack from another user.\n"
+                 "You must decrypt the game assets first (Decrypt tab) "
+                 "before exporting or importing mods.",
+            foreground=c["gray"], wraplength=700, justify=tk.LEFT)
+        self._modify_desc.pack(anchor=tk.W, pady=(0, 6))
+
+        # Export / Import buttons
+        btn_row = ttk.Frame(parent)
+        btn_row.pack(fill=tk.X, pady=(0, 6))
+        self.modify_export_btn = ttk.Button(btn_row, text="Export Mod Pack...",
+                                             command=self._on_export)
+        self.modify_export_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.modify_import_btn = ttk.Button(btn_row, text="Import Mod Pack...",
+                                             command=self._on_import)
+        self.modify_import_btn.pack(side=tk.LEFT)
+
+    def _browse_modify_input(self):
+        path = filedialog.askdirectory(
+            title="Select Mod Folder (decrypted game assets)")
+        if path:
+            self.modify_input_var.set(path)
+
+    # ------------------------------------------------------------------
+    # Write tab
+    # ------------------------------------------------------------------
+
+    def _build_write_tab(self, parent):
+        c = _THEMES[self._current_theme]
+
+        # Radio toggle: Build USB ISO / Write to SSD
         radio_row = ttk.Frame(parent)
         radio_row.pack(fill=tk.X, pady=(0, 6))
-        self._install_method_var = tk.StringVar(value="iso")
+        self._write_method_var = tk.StringVar(value="iso")
         ttk.Radiobutton(radio_row, text="Build USB ISO",
-                        variable=self._install_method_var, value="iso"
+                        variable=self._write_method_var, value="iso"
                         ).pack(side=tk.LEFT, padx=(0, 16))
         ttk.Radiobutton(radio_row, text="Write to SSD",
-                        variable=self._install_method_var, value="ssd"
-                        ).pack(side=tk.LEFT, padx=(0, 16))
-        ttk.Radiobutton(radio_row, text="Import Mod Pack",
-                        variable=self._install_method_var, value="import"
+                        variable=self._write_method_var, value="ssd"
                         ).pack(side=tk.LEFT)
 
-        # Conditional content area — swap children inside this stable container
-        self._install_content_area = ttk.Frame(parent)
-        self._install_content_area.pack(fill=tk.X)
+        # --- Per-tab config fields ---
+        cfg_frame = ttk.LabelFrame(parent, text=" Configuration ", padding=6)
+        cfg_frame.pack(fill=tk.X, pady=(0, 6))
 
-        self._install_iso_frame = ttk.Frame(self._install_content_area)
-        self._install_ssd_frame = ttk.Frame(self._install_content_area)
-        self._install_import_frame = ttk.Frame(self._install_content_area)
+        _tf = lambda: self._current_theme
+
+        # Input Folder
+        self._write_input_row = ttk.Frame(cfg_frame)
+        self._write_input_row.pack(fill=tk.X, pady=2)
+        lbl = ttk.Label(self._write_input_row, text="Game Assets:", width=20,
+                        anchor=tk.W)
+        lbl.pack(side=tk.LEFT)
+        _Tooltip(lbl, "Folder containing your modified game files "
+                 "(set automatically by the Decrypt tab)", _tf)
+        self.write_input_var = self.output_var  # same folder as Decrypt output
+        self.write_input_entry = ttk.Entry(self._write_input_row,
+                                            textvariable=self.write_input_var)
+        self.write_input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                     padx=(0, 4))
+        ttk.Button(self._write_input_row, text="Browse...",
+                   command=self._browse_write_input, width=10).pack(side=tk.LEFT)
+
+        # Original Game Image (ISO mode only)
+        self._write_orig_image_row = ttk.Frame(cfg_frame)
+        self._write_orig_image_row.pack(fill=tk.X, pady=2)
+        lbl = ttk.Label(self._write_orig_image_row, text="Original Game Image:",
+                        width=20, anchor=tk.W)
+        lbl.pack(side=tk.LEFT)
+        _Tooltip(lbl, "The unmodified Clonezilla ISO \u2014 needed as a "
+                 "base to build the new image", _tf)
+        self.write_orig_image_var = self.image_var  # same as Decrypt tab
+        self.write_orig_image_entry = ttk.Entry(
+            self._write_orig_image_row,
+            textvariable=self.write_orig_image_var)
+        self.write_orig_image_entry.pack(side=tk.LEFT, fill=tk.X,
+                                          expand=True, padx=(0, 4))
+        ttk.Button(self._write_orig_image_row, text="Browse...",
+                   command=self._browse_write_orig_image,
+                   width=10).pack(side=tk.LEFT)
+
+        # Output Image (ISO mode only)
+        self._write_output_row = ttk.Frame(cfg_frame)
+        self._write_output_row.pack(fill=tk.X, pady=2)
+        lbl = ttk.Label(self._write_output_row, text="Output Image:", width=20,
+                        anchor=tk.W)
+        lbl.pack(side=tk.LEFT)
+        _Tooltip(lbl, "Where to save the modified ISO file for "
+                 "USB installation", _tf)
+        self.write_output_var = tk.StringVar()
+        self.write_output_entry = ttk.Entry(self._write_output_row,
+                                             textvariable=self.write_output_var)
+        self.write_output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                      padx=(0, 4))
+        ttk.Button(self._write_output_row, text="Browse...",
+                   command=self._browse_write_output, width=10).pack(side=tk.LEFT)
+
+        # Game SSD (SSD mode only)
+        self._write_ssd_row = ttk.Frame(cfg_frame)
+        lbl = ttk.Label(self._write_ssd_row, text="Game SSD:", width=20,
+                        anchor=tk.W)
+        lbl.pack(side=tk.LEFT)
+        _Tooltip(lbl, "The JJP game SSD connected via USB enclosure", _tf)
+        self.write_ssd_var = tk.StringVar()
+        self.write_ssd_combo = ttk.Combobox(
+            self._write_ssd_row, textvariable=self.write_ssd_var,
+            state="readonly")
+        self.write_ssd_combo.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                   padx=(0, 4))
+        self.write_ssd_combo.bind(
+            "<<ComboboxSelected>>", self._on_write_ssd_device_selected)
+        ttk.Button(self._write_ssd_row, text="Refresh",
+                   command=self._ssd_refresh_write_devices,
+                   width=10).pack(side=tk.LEFT)
+
+        self._write_cfg_frame = cfg_frame
+
+        # Conditional content area
+        self._write_content_area = ttk.Frame(parent)
+        self._write_content_area.pack(fill=tk.X)
+
+        self._write_iso_frame = ttk.Frame(self._write_content_area)
+        self._write_ssd_frame = ttk.Frame(self._write_content_area)
 
         # ISO sub-section
-        self._install_desc = ttk.Label(
-            self._install_iso_frame,
+        self._write_desc = ttk.Label(
+            self._write_iso_frame,
             text="Re-encrypt changed files into the game image and build "
-                 "a new ISO for USB drive installation.",
+                 "a new ISO for USB drive installation. Audio files are "
+                 "automatically trimmed or padded to match the original "
+                 "duration.",
             foreground=c["gray"], wraplength=700, justify=tk.LEFT)
-        self._install_desc.pack(anchor=tk.W, pady=(0, 6))
+        self._write_desc.pack(anchor=tk.W, pady=(0, 6))
 
         # SSD sub-section
-        self._install_ssd_warning = ttk.Label(
-            self._install_ssd_frame,
+        self._write_ssd_warning = ttk.Label(
+            self._write_ssd_frame,
             text=("\u26A0  Remove the SSD from the pinball machine before "
                   "connecting. Always keep the original ISO as a backup."),
             foreground=c["error"], wraplength=700, justify=tk.LEFT)
-        self._install_ssd_warning.pack(anchor=tk.W, pady=(0, 6))
+        self._write_ssd_warning.pack(anchor=tk.W, pady=(0, 6))
 
-        self._install_ssd_desc = ttk.Label(
-            self._install_ssd_frame,
+        self._write_admin_warning = ttk.Label(
+            self._write_ssd_frame,
+            text="\u26A0  SSD mode requires Run as Administrator "
+                 "(right-click the app \u2192 Run as administrator).",
+            foreground=c["error"], wraplength=700, justify=tk.LEFT)
+        if not _is_admin():
+            self._write_admin_warning.pack(anchor=tk.W, pady=(0, 6))
+
+        self._write_ssd_desc = ttk.Label(
+            self._write_ssd_frame,
             text="Re-encrypt changed files and write them directly "
-                 "to the game SSD.",
+                 "to the game SSD. Audio files are automatically trimmed "
+                 "or padded to match the original duration.",
             foreground=c["gray"], wraplength=700, justify=tk.LEFT)
-        self._install_ssd_desc.pack(anchor=tk.W, pady=(0, 6))
-
-        # Import sub-section
-        self._install_import_desc = ttk.Label(
-            self._install_import_frame,
-            text="Apply a mod pack ZIP (from another user) to your "
-                 "decrypted output folder, then use Build USB ISO or "
-                 "Write to SSD to install.",
-            foreground=c["gray"], wraplength=700, justify=tk.LEFT)
-        self._install_import_desc.pack(anchor=tk.W, pady=(0, 6))
+        self._write_ssd_desc.pack(anchor=tk.W, pady=(0, 6))
 
         # Show ISO frame initially
-        self._install_iso_frame.pack(fill=tk.X, in_=self._install_content_area)
+        self._write_iso_frame.pack(fill=tk.X, in_=self._write_content_area)
 
-        # Shared step indicators
-        self._install_step_row = ttk.Frame(parent)
-        self._install_step_row.pack(fill=tk.X, pady=(0, 6))
-        self.install_step_labels = []
-        self._build_step_labels(self._install_step_row,
+        # --- File tree preview of modified files ---
+        write_tree_frame = ttk.LabelFrame(
+            parent, text=" Modified Files Preview ", padding=4)
+        write_tree_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+
+        self.write_tree = ttk.Treeview(
+            write_tree_frame, columns=("type", "status"),
+            height=8, selectmode="browse")
+        self.write_tree.heading("#0", text="File", anchor=tk.W)
+        self.write_tree.heading("type", text="Type", anchor=tk.W)
+        self.write_tree.heading("status", text="Status", anchor=tk.W)
+        self.write_tree.column("#0", width=400, minwidth=200)
+        self.write_tree.column("type", width=60, minwidth=40)
+        self.write_tree.column("status", width=200, minwidth=100)
+
+        write_tree_scroll = ttk.Scrollbar(
+            write_tree_frame, orient=tk.VERTICAL,
+            command=self.write_tree.yview)
+        self.write_tree.configure(yscrollcommand=write_tree_scroll.set)
+        write_tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.write_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.write_tree.tag_configure("modified", foreground="#1976D2")
+        self.write_tree.tag_configure("ok", foreground="#2E7D32")
+        self.write_tree.tag_configure("trimmed", foreground="#E65100")
+        self.write_tree.tag_configure("padded", foreground="#1565C0")
+        self.write_tree.tag_configure("converted", foreground="#6A1B9A")
+        self.write_tree.tag_configure("warning", foreground="#C62828")
+
+        self._write_tree_items = {}
+        self._write_scan_id = None  # track background scan
+
+        self._write_tree_empty = ttk.Label(
+            write_tree_frame,
+            text="Switch to this tab to scan for modified files",
+            foreground="gray", anchor=tk.CENTER, justify=tk.CENTER)
+        self._write_tree_empty.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+
+        # Step indicators
+        self._write_step_row = ttk.Frame(parent)
+        self._write_step_row.pack(fill=tk.X, pady=(0, 6))
+        self.write_step_labels = []
+        self._build_step_labels(self._write_step_row,
                                 config.STANDALONE_MOD_PHASES,
-                                self.install_step_labels)
+                                self.write_step_labels)
 
-        # Shared progress bar
+        # Progress bar
         prog_row = ttk.Frame(parent)
         prog_row.pack(fill=tk.X, pady=(0, 6))
-        self.install_progress_label = ttk.Label(prog_row, text="", anchor=tk.E)
-        self.install_progress_label.pack(side=tk.RIGHT)
-        self.install_progress = ttk.Progressbar(prog_row, mode="determinate")
-        self.install_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.write_progress_label = ttk.Label(prog_row, text="", anchor=tk.E)
+        self.write_progress_label.pack(side=tk.RIGHT)
+        self.write_progress = ttk.Progressbar(prog_row, mode="determinate")
+        self.write_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
 
         # Action buttons
         btn_row = ttk.Frame(parent)
         btn_row.pack()
-        self.install_apply_btn = ttk.Button(btn_row, text="Apply Modifications",
-                                             command=self._on_mod_apply)
-        self.install_apply_btn.pack(side=tk.LEFT, padx=4)
-        self.install_cancel_btn = ttk.Button(btn_row, text="Cancel",
-                                              command=self._on_mod_cancel,
-                                              state=tk.DISABLED)
-        self.install_cancel_btn.pack(side=tk.LEFT, padx=4)
+        self.write_apply_btn = ttk.Button(btn_row, text="Apply Modifications",
+                                           command=self._on_mod_apply)
+        self.write_apply_btn.pack(side=tk.LEFT, padx=4)
+        self.write_cancel_btn = ttk.Button(btn_row, text="Cancel",
+                                            command=self._on_mod_cancel,
+                                            state=tk.DISABLED)
+        self.write_cancel_btn.pack(side=tk.LEFT, padx=4)
 
         # Bind radio changes
-        self._install_method_var.trace_add("write", self._on_install_method_changed)
+        self._write_method_var.trace_add("write", self._on_write_method_changed)
 
-    def _on_install_method_changed(self, *_args):
-        """Show/hide widgets when Install Mods method radio changes."""
-        method = self._install_method_var.get()
+    def _on_write_method_changed(self, *_args):
+        """Show/hide widgets when Write method radio changes."""
+        method = self._write_method_var.get()
 
         # Hide all conditional frames
-        self._install_iso_frame.pack_forget()
-        self._install_ssd_frame.pack_forget()
-        self._install_import_frame.pack_forget()
+        self._write_iso_frame.pack_forget()
+        self._write_ssd_frame.pack_forget()
+
+        # Show/hide config rows based on mode
+        self._write_input_row.pack_forget()
+        self._write_orig_image_row.pack_forget()
+        self._write_output_row.pack_forget()
+        self._write_ssd_row.pack_forget()
 
         if method == "iso":
-            self._install_iso_frame.pack(fill=tk.X,
-                in_=self._install_content_area)
+            self._write_input_row.pack(fill=tk.X, pady=2,
+                in_=self._write_cfg_frame)
+            self._write_orig_image_row.pack(fill=tk.X, pady=2,
+                in_=self._write_cfg_frame)
+            self._write_output_row.pack(fill=tk.X, pady=2,
+                in_=self._write_cfg_frame)
+            self._write_iso_frame.pack(fill=tk.X,
+                in_=self._write_content_area)
             phases = config.STANDALONE_MOD_PHASES
-            self._install_step_row.pack(fill=tk.X, pady=(0, 6))
-            self.install_apply_btn.configure(text="Apply Modifications")
-            self.install_cancel_btn.pack(side=tk.LEFT, padx=4)
-        elif method == "ssd":
-            self._install_ssd_frame.pack(fill=tk.X,
-                in_=self._install_content_area)
+            self.write_apply_btn.configure(text="Apply Modifications")
+        else:  # ssd
+            self._write_input_row.pack(fill=tk.X, pady=2,
+                in_=self._write_cfg_frame)
+            self._write_ssd_row.pack(fill=tk.X, pady=2,
+                in_=self._write_cfg_frame)
+            self._write_ssd_frame.pack(fill=tk.X,
+                in_=self._write_content_area)
             phases = config.DIRECT_SSD_MOD_PHASES
-            self._install_step_row.pack(fill=tk.X, pady=(0, 6))
-            self.install_apply_btn.configure(text="Apply Modifications")
-            self.install_cancel_btn.pack(side=tk.LEFT, padx=4)
-        else:  # import
-            self._install_import_frame.pack(fill=tk.X,
-                in_=self._install_content_area)
-            phases = []
-            self._install_step_row.pack_forget()
-            self.install_apply_btn.configure(text="Import Mod Pack")
-            self.install_cancel_btn.pack_forget()
+            self.write_apply_btn.configure(text="Apply Modifications")
+            # Auto-refresh device list when switching to SSD mode
+            if not getattr(self, '_write_ssd_devices', None):
+                self._ssd_refresh_write_devices()
 
-        if phases:
-            self._build_step_labels(self._install_step_row, phases,
-                                    self.install_step_labels)
-        else:
-            for w in self._install_step_row.winfo_children():
-                w.destroy()
-            self.install_step_labels.clear()
+        self._build_step_labels(self._write_step_row, phases,
+                                self.write_step_labels)
 
         # Re-fit notebook height
         self._on_tab_changed()
@@ -705,6 +937,9 @@ class MainWindow:
             widget = self.notebook.nametowidget(tab)
             widget.update_idletasks()
             self.notebook.configure(height=widget.winfo_reqheight())
+            # Auto-scan for modified files when Write tab is selected
+            if self.notebook.index(tab) == 1:
+                self.scan_write_preview()
 
     # ------------------------------------------------------------------
     # SSD device management
@@ -723,7 +958,7 @@ class MainWindow:
             self.ssd_device_combo.current(0)
 
     def get_ssd_device(self):
-        """Return the selected DiskInfo, or None if nothing valid selected."""
+        """Return the selected DiskInfo from Decrypt tab, or None."""
         if not hasattr(self, '_ssd_devices'):
             return None
         idx = self.ssd_device_combo.current()
@@ -731,13 +966,46 @@ class MainWindow:
             return self._ssd_devices[idx]
         return None
 
-    def get_create_source(self):
-        """Return 'iso', 'ssd', or 'export' based on the Create Mods radio."""
-        return self._create_source_var.get()
+    def _on_ssd_device_selected(self, event=None):
+        """Confirm when user selects a device on the Decrypt tab."""
+        self._confirm_ssd_selection(
+            self.ssd_device_combo, "_ssd_devices", "read from")
 
-    def get_install_method(self):
-        """Return 'iso', 'ssd', or 'import' based on the Install Mods radio."""
-        return self._install_method_var.get()
+    def _on_write_ssd_device_selected(self, event=None):
+        """Confirm when user selects a device on the Write tab."""
+        self._confirm_ssd_selection(
+            self.write_ssd_combo, "_write_ssd_devices", "write to")
+
+    def _confirm_ssd_selection(self, combo, devices_attr, action_verb):
+        """Show a confirmation dialog after the user selects an SSD."""
+        from tkinter import messagebox
+
+        devices = getattr(self, devices_attr, [])
+        idx = combo.current()
+        if idx < 0 or idx >= len(devices):
+            return
+
+        device = devices[idx]
+        confirmed = messagebox.askyesno(
+            "Confirm Drive Selection",
+            f"You selected:\n\n"
+            f"  Model:   {device.model}\n"
+            f"  Size:      {device.size_display}\n"
+            f"  Bus:       {device.bus_type}\n"
+            f"  Device:  {device.device_id}\n\n"
+            f"This tool will {action_verb} this drive.\n\n"
+            f"Is this the correct JJP game SSD?",
+        )
+        if not confirmed:
+            combo.set("")
+
+    def get_decrypt_source(self):
+        """Return 'iso' or 'ssd' based on the Decrypt tab radio."""
+        return self._decrypt_source_var.get()
+
+    def get_write_method(self):
+        """Return 'iso' or 'ssd' based on the Write tab radio."""
+        return self._write_method_var.get()
 
     # ------------------------------------------------------------------
     # Log output
@@ -798,6 +1066,201 @@ class MainWindow:
         path = filedialog.askdirectory(title="Select Output Folder")
         if path:
             self.output_var.set(path)
+
+    def _browse_write_input(self):
+        path = filedialog.askdirectory(title="Select Input Folder (modified assets)")
+        if path:
+            self.write_input_var.set(path)
+
+    def _browse_write_orig_image(self):
+        path = filedialog.askopenfilename(
+            title="Select Original Game Image (ISO or ext4)",
+            filetypes=[
+                ("All Files", "*.*"),
+                ("JJP Game Images", "*.iso *.img *.ext4 *.raw"),
+                ("ISO Images", "*.iso"),
+                ("Disk Images", "*.img *.ext4 *.raw"),
+            ],
+        )
+        if path:
+            self.write_orig_image_var.set(path)
+
+    def _browse_write_output(self):
+        path = filedialog.asksaveasfilename(
+            title="Save Modified ISO As",
+            defaultextension=".iso",
+            filetypes=[
+                ("ISO Images", "*.iso"),
+                ("Disk Images", "*.img"),
+                ("All Files", "*.*"),
+            ],
+        )
+        if path:
+            self.write_output_var.set(path)
+
+    def _ssd_refresh_write_devices(self):
+        """Refresh the Write tab SSD device dropdown."""
+        from .executor import list_disk_devices
+        self._write_ssd_devices = list_disk_devices()
+        values = [str(d) for d in self._write_ssd_devices]
+        if not values:
+            values = ["(no drives detected \u2014 connect SSD and click Refresh)"]
+            self._write_ssd_devices = []
+        self.write_ssd_combo.configure(values=values)
+        if values:
+            self.write_ssd_combo.current(0)
+
+    def get_write_ssd_device(self):
+        """Return the selected DiskInfo for Write tab, or None."""
+        if not hasattr(self, '_write_ssd_devices'):
+            return None
+        idx = self.write_ssd_combo.current()
+        if 0 <= idx < len(self._write_ssd_devices):
+            return self._write_ssd_devices[idx]
+        return None
+
+    # ------------------------------------------------------------------
+    # Write tab: modified-files preview
+    # ------------------------------------------------------------------
+
+    def _update_write_tree(self, rel_path, status="Modified"):
+        """Insert or update a file in the Write tab's preview tree."""
+        import os as _os
+        ext = _os.path.splitext(rel_path)[1].upper().lstrip(".")
+
+        status_lower = status.lower()
+        if "trim" in status_lower:
+            tag = "trimmed"
+        elif "pad" in status_lower:
+            tag = "padded"
+        elif "convert" in status_lower:
+            tag = "converted"
+        elif "warning" in status_lower or "fail" in status_lower:
+            tag = "warning"
+        elif "ok" in status_lower or "encrypt" in status_lower:
+            tag = "ok"
+        else:
+            tag = "modified"
+
+        if self._write_tree_empty.winfo_ismapped():
+            self._write_tree_empty.place_forget()
+
+        if rel_path in self._write_tree_items:
+            item_id = self._write_tree_items[rel_path]
+            self.write_tree.item(item_id, values=(ext, status), tags=(tag,))
+        else:
+            parts = rel_path.replace("\\", "/").split("/")
+            parent = ""
+            for i, part in enumerate(parts[:-1]):
+                folder_path = "/".join(parts[:i + 1])
+                if folder_path not in self._write_tree_items:
+                    node = self.write_tree.insert(
+                        parent, tk.END, text=part, open=(i < 2))
+                    self._write_tree_items[folder_path] = node
+                parent = self._write_tree_items[folder_path]
+
+            item_id = self.write_tree.insert(
+                parent, tk.END, text=parts[-1],
+                values=(ext, status), tags=(tag,))
+            self._write_tree_items[rel_path] = item_id
+
+    def scan_write_preview(self):
+        """Scan the Game Assets folder for modified files (background thread).
+
+        Populates the Write tab's preview tree with changed files.
+        """
+        import hashlib
+        import os
+        import re as _re
+        import threading
+
+        assets_path = self.output_var.get().strip()
+        if not assets_path or not os.path.isdir(assets_path):
+            return
+        checksums_file = os.path.join(assets_path, '.checksums.md5')
+        if not os.path.isfile(checksums_file):
+            return
+
+        # Bump scan ID so any in-flight scan stops posting results
+        scan_id = (self._write_scan_id or 0) + 1
+        self._write_scan_id = scan_id
+
+        # Clear current tree
+        self.write_tree.delete(*self.write_tree.get_children())
+        self._write_tree_items = {}
+        self._write_tree_empty.configure(text="Scanning for changes...")
+        self._write_tree_empty.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+
+        def _scan():
+            # Load baseline checksums
+            saved = {}
+            with open(checksums_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    m = _re.match(r'^([a-f0-9]{32})\s+\*?(.+)$', line)
+                    if m:
+                        fp = m.group(2)
+                        if fp.startswith('./'):
+                            fp = fp[2:]
+                        saved[fp] = m.group(1)
+
+            changed = []
+            for root, _dirs, files in os.walk(assets_path):
+                for name in files:
+                    if name.startswith('.') or name == 'fl_decrypted.dat' \
+                            or name.endswith('.img'):
+                        continue
+                    full = os.path.join(root, name)
+                    rel = os.path.relpath(full, assets_path).replace('\\', '/')
+                    if rel not in saved:
+                        continue
+                    h = hashlib.md5()
+                    with open(full, 'rb') as fh:
+                        for chunk in iter(lambda: fh.read(65536), b''):
+                            h.update(chunk)
+                    if h.hexdigest() != saved[rel]:
+                        changed.append(rel)
+                        # Post to GUI thread
+                        if self._write_scan_id != scan_id:
+                            return  # superseded by a newer scan
+                        self.root.after(0, self._update_write_tree, rel,
+                                        "Modified")
+
+            # Final update
+            if self._write_scan_id == scan_id:
+                def _finish():
+                    if not changed:
+                        self._write_tree_empty.configure(
+                            text="No modified files detected")
+                        self._write_tree_empty.place(
+                            relx=0.5, rely=0.5, anchor=tk.CENTER)
+                self.root.after(0, _finish)
+
+        threading.Thread(target=_scan, daemon=True).start()
+
+    def _play_file(self, path):
+        """Play/open a file with the system default handler."""
+        import os as _os
+        import subprocess
+        if sys.platform == "win32":
+            _os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+
+    def _open_in_explorer(self, path):
+        """Open the containing folder and select the file."""
+        import subprocess
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", "/select,", path.replace("/", "\\")])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        else:
+            import os as _os
+            subprocess.Popen(["xdg-open", _os.path.dirname(path)])
 
     # --- Public methods called by App ---
 
@@ -865,8 +1328,8 @@ class MainWindow:
     def _get_labels_for_mode(self, mode):
         """Return the appropriate step labels list for a mode."""
         if mode in ("decrypt", "decrypt_standalone", "ssd_decrypt"):
-            return self.create_step_labels
-        return self.install_step_labels
+            return self.decrypt_step_labels
+        return self.write_step_labels
 
     def set_phase(self, phase_index, mode="decrypt"):
         """Highlight the current phase in the step indicator."""
@@ -882,22 +1345,22 @@ class MainWindow:
 
         # Reset progress bar to indeterminate until the phase sets its own progress
         if mode in ("decrypt", "decrypt_standalone", "ssd_decrypt"):
-            self.create_progress.configure(mode="indeterminate")
-            self.create_progress.start(15)
-            self.create_progress_label.configure(text="")
+            self.decrypt_progress.configure(mode="indeterminate")
+            self.decrypt_progress.start(15)
+            self.decrypt_progress_label.configure(text="")
         else:
-            self.install_progress.configure(mode="indeterminate")
-            self.install_progress.start(15)
-            self.install_progress_label.configure(text="")
+            self.write_progress.configure(mode="indeterminate")
+            self.write_progress.start(15)
+            self.write_progress_label.configure(text="")
 
     def set_progress(self, current, total, description="", mode="decrypt"):
         """Update the progress bar and label."""
         if mode in ("decrypt", "decrypt_standalone", "ssd_decrypt"):
-            bar = self.create_progress
-            label = self.create_progress_label
+            bar = self.decrypt_progress
+            label = self.decrypt_progress_label
         else:
-            bar = self.install_progress
-            label = self.install_progress_label
+            bar = self.write_progress
+            label = self.write_progress_label
 
         if total > 0:
             bar.stop()
@@ -909,43 +1372,56 @@ class MainWindow:
             bar.start(15)
             label.configure(text=description)
 
-    def set_game_name(self, name):
-        """Update the detected game label."""
-        c = _THEMES[self._current_theme]
-        display = config.KNOWN_GAMES.get(name, name)
-        self.game_label.configure(text=display, foreground=c["fg"])
-
     def set_running(self, running, mode="decrypt"):
         """Toggle between running and idle state."""
         if running:
             self.image_entry.configure(state=tk.DISABLED)
             self.output_entry.configure(state=tk.DISABLED)
             self.ssd_device_combo.configure(state=tk.DISABLED)
+            self.modify_input_entry.configure(state=tk.DISABLED)
+            self.write_input_entry.configure(state=tk.DISABLED)
+            self.write_orig_image_entry.configure(state=tk.DISABLED)
+            self.write_output_entry.configure(state=tk.DISABLED)
+            self.write_ssd_combo.configure(state=tk.DISABLED)
             self.check_btn.configure(state=tk.DISABLED)
-            self.create_start_btn.configure(state=tk.DISABLED)
-            self.install_apply_btn.configure(state=tk.DISABLED)
+            self.decrypt_start_btn.configure(state=tk.DISABLED)
+            self.modify_import_btn.configure(state=tk.DISABLED)
+            self.modify_export_btn.configure(state=tk.DISABLED)
+            self.write_apply_btn.configure(state=tk.DISABLED)
             if mode in ("decrypt", "decrypt_standalone", "ssd_decrypt"):
-                self.create_cancel_btn.configure(state=tk.NORMAL)
+                self.decrypt_cancel_btn.configure(state=tk.NORMAL)
             else:
-                self.install_cancel_btn.configure(state=tk.NORMAL)
+                self.write_cancel_btn.configure(state=tk.NORMAL)
             self._start_time = time.time()
             self._update_timer()
         else:
             self.image_entry.configure(state=tk.NORMAL)
             self.output_entry.configure(state=tk.NORMAL)
             self.ssd_device_combo.configure(state="readonly")
+            self.modify_input_entry.configure(state=tk.NORMAL)
+            self.write_input_entry.configure(state=tk.NORMAL)
+            self.write_orig_image_entry.configure(state=tk.NORMAL)
+            self.write_output_entry.configure(state=tk.NORMAL)
+            self.write_ssd_combo.configure(state="readonly")
             self.check_btn.configure(state=tk.NORMAL)
-            self.create_start_btn.configure(state=tk.NORMAL)
-            self.create_cancel_btn.configure(state=tk.DISABLED)
-            self.install_apply_btn.configure(state=tk.NORMAL)
-            self.install_cancel_btn.configure(state=tk.DISABLED)
-            # Stop any indeterminate animation and fill to 100%
-            self.create_progress.stop()
-            self.create_progress.configure(mode="determinate", maximum=100, value=100)
-            self.create_progress_label.configure(text="100%")
-            self.install_progress.stop()
-            self.install_progress.configure(mode="determinate", maximum=100, value=100)
-            self.install_progress_label.configure(text="100%")
+            self.decrypt_start_btn.configure(state=tk.NORMAL)
+            self.decrypt_cancel_btn.configure(state=tk.DISABLED)
+            self.modify_import_btn.configure(state=tk.NORMAL)
+            self.modify_export_btn.configure(state=tk.NORMAL)
+            self.write_apply_btn.configure(state=tk.NORMAL)
+            self.write_cancel_btn.configure(state=tk.DISABLED)
+            # Stop any indeterminate animation and fill to 100% — only
+            # on the bar that was actually running.
+            if mode in ("decrypt", "decrypt_standalone", "ssd_decrypt"):
+                self.decrypt_progress.stop()
+                self.decrypt_progress.configure(
+                    mode="determinate", maximum=100, value=100)
+                self.decrypt_progress_label.configure(text="100%")
+            else:
+                self.write_progress.stop()
+                self.write_progress.configure(
+                    mode="determinate", maximum=100, value=100)
+                self.write_progress_label.configure(text="100%")
             self._start_time = None
             if self._timer_id:
                 self.root.after_cancel(self._timer_id)
@@ -968,21 +1444,21 @@ class MainWindow:
         phases = phase_map.get(mode, config.PHASES)
 
         if mode in ("decrypt", "decrypt_standalone", "ssd_decrypt"):
-            if len(self.create_step_labels) != len(phases):
-                self._build_step_labels(self._create_step_row, phases,
-                                        self.create_step_labels)
-            labels = self.create_step_labels
-            self.create_progress.stop()
-            self.create_progress.configure(mode="determinate", value=0, maximum=100)
-            self.create_progress_label.configure(text="")
+            if len(self.decrypt_step_labels) != len(phases):
+                self._build_step_labels(self._decrypt_step_row, phases,
+                                        self.decrypt_step_labels)
+            labels = self.decrypt_step_labels
+            self.decrypt_progress.stop()
+            self.decrypt_progress.configure(mode="determinate", value=0, maximum=100)
+            self.decrypt_progress_label.configure(text="")
         else:
-            if len(self.install_step_labels) != len(phases):
-                self._build_step_labels(self._install_step_row, phases,
-                                        self.install_step_labels)
-            labels = self.install_step_labels
-            self.install_progress.stop()
-            self.install_progress.configure(mode="determinate", value=0, maximum=100)
-            self.install_progress_label.configure(text="")
+            if len(self.write_step_labels) != len(phases):
+                self._build_step_labels(self._write_step_row, phases,
+                                        self.write_step_labels)
+            labels = self.write_step_labels
+            self.write_progress.stop()
+            self.write_progress.configure(mode="determinate", value=0, maximum=100)
+            self.write_progress_label.configure(text="")
 
         c = _THEMES[self._current_theme]
         for lbl in labels:

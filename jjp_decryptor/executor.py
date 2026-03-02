@@ -21,6 +21,19 @@ _DOCKER_IMAGE = "jjp-decryptor"
 _DOCKER_CONTAINER = "jjp-decryptor-worker"
 
 
+def _decode_output(data):
+    """Decode subprocess output bytes, handling UTF-16LE from wsl.exe."""
+    if not data:
+        return ""
+    # wsl.exe outputs UTF-16LE — detect by checking for null bytes
+    if b"\x00" in data[:64]:
+        try:
+            return data.decode("utf-16-le").strip()
+        except UnicodeDecodeError:
+            pass
+    return data.decode("utf-8", errors="replace").strip()
+
+
 class CommandError(Exception):
     """Raised when a command execution fails."""
     def __init__(self, cmd, returncode, output):
@@ -85,14 +98,13 @@ class CommandExecutor:
             result = subprocess.run(
                 args,
                 capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=timeout,
                 shell=True,
                 creationflags=_CREATE_FLAGS,
             )
-            return result.returncode, result.stdout, result.stderr
+            stdout = _decode_output(result.stdout)
+            stderr = _decode_output(result.stderr)
+            return result.returncode, stdout, stderr
         except subprocess.TimeoutExpired:
             return -1, "", f"Command timed out after {timeout}s"
         except FileNotFoundError:
@@ -527,14 +539,16 @@ def create_executor():
 
 class DiskInfo:
     """Information about a detected disk device."""
-    def __init__(self, device_id, model, size_bytes, size_display):
+    def __init__(self, device_id, model, size_bytes, size_display,
+                 bus_type="Unknown"):
         self.device_id = device_id      # e.g. \\.\PHYSICALDRIVE2 or /dev/sdb
         self.model = model              # e.g. "Samsung SSD 860"
         self.size_bytes = size_bytes     # raw size in bytes
         self.size_display = size_display  # e.g. "120 GB"
+        self.bus_type = bus_type         # e.g. "USB", "Thunderbolt"
 
     def __str__(self):
-        return f"{self.model} ({self.size_display}) — {self.device_id}"
+        return f"{self.model} ({self.size_display}, {self.bus_type}) — {self.device_id}"
 
 
 def _format_size(size_bytes):
@@ -563,14 +577,14 @@ def list_disk_devices():
 
 
 def _list_disks_windows():
-    """List physical disks on Windows via PowerShell WMI query."""
+    """List USB/external physical disks on Windows via PowerShell WMI."""
     disks = []
     try:
-        # Get all physical drives (excluding the boot drive)
         ps_cmd = (
-            'Get-CimInstance -Query "SELECT DeviceID, Model, Size, Index '
-            'FROM Win32_DiskDrive" | '
-            'ForEach-Object { "$($_.DeviceID)|$($_.Model)|$($_.Size)|$($_.Index)" }'
+            'Get-CimInstance -Query "SELECT DeviceID, Model, Size, Index, '
+            'InterfaceType, MediaType FROM Win32_DiskDrive" | '
+            'ForEach-Object { "$($_.DeviceID)|$($_.Model)|$($_.Size)'
+            '|$($_.Index)|$($_.InterfaceType)|$($_.MediaType)" }'
         )
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps_cmd],
@@ -603,9 +617,14 @@ def _list_disks_windows():
             if not line or "|" not in line:
                 continue
             parts = line.split("|")
-            if len(parts) < 4:
+            if len(parts) < 6:
                 continue
-            device_id, model, size_str, index_str = parts[0], parts[1], parts[2], parts[3]
+            device_id = parts[0].strip()
+            model = parts[1].strip()
+            size_str = parts[2].strip()
+            index_str = parts[3].strip()
+            interface_type = parts[4].strip()   # "USB", "IDE", "SCSI"
+            media_type = parts[5].strip()       # "External hard disk media", etc.
             try:
                 size = int(size_str)
                 index = int(index_str)
@@ -618,11 +637,23 @@ def _list_disks_windows():
             if size < 1024**3:
                 continue
 
+            # SAFETY: only show USB / external drives
+            is_usb = interface_type.upper() == "USB"
+            is_external = ("external" in media_type.lower()
+                           or "removable" in media_type.lower())
+            if not (is_usb or is_external):
+                continue
+
+            bus_type = ("USB" if is_usb
+                       else "External" if is_external
+                       else interface_type)
+
             disks.append(DiskInfo(
-                device_id=device_id.strip(),
-                model=model.strip(),
+                device_id=device_id,
+                model=model,
                 size_bytes=size,
                 size_display=_format_size(size),
+                bus_type=bus_type,
             ))
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
@@ -658,6 +689,7 @@ def _list_disks_macos():
                 capture_output=True, timeout=10,
             )
             model = "Unknown"
+            bus_type = "Unknown"
             if info_result.returncode == 0:
                 info = plistlib.loads(info_result.stdout)
                 model = info.get("MediaName", "Unknown")
@@ -666,6 +698,8 @@ def _list_disks_macos():
                 # Skip internal/boot disk
                 if info.get("Internal", False):
                     continue
+                bus_type = info.get("DeviceProtocol",
+                                    info.get("Protocol", "External"))
 
             if size < 1024**3:
                 continue
@@ -675,6 +709,7 @@ def _list_disks_macos():
                 model=model,
                 size_bytes=size,
                 size_display=_format_size(size),
+                bus_type=bus_type,
             ))
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
@@ -682,19 +717,19 @@ def _list_disks_macos():
 
 
 def _list_disks_linux():
-    """List physical disks on Linux via lsblk."""
+    """List USB/removable physical disks on Linux via lsblk."""
     disks = []
     try:
         result = subprocess.run(
-            ["lsblk", "-d", "-b", "-n", "-o", "NAME,SIZE,MODEL,RM,TYPE"],
+            ["lsblk", "-d", "-b", "-n", "-o", "NAME,SIZE,MODEL,RM,TYPE,TRAN"],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode != 0:
             return disks
 
         for line in result.stdout.strip().splitlines():
-            parts = line.split(None, 4)
-            if len(parts) < 4:
+            parts = line.split(None, 5)
+            if len(parts) < 5:
                 continue
             name = parts[0]
             try:
@@ -704,6 +739,7 @@ def _list_disks_linux():
             model = parts[2] if len(parts) > 2 else "Unknown"
             removable = parts[3] if len(parts) > 3 else "0"
             dev_type = parts[4].strip() if len(parts) > 4 else "disk"
+            transport = parts[5].strip().lower() if len(parts) > 5 else ""
 
             # Only show disks (not partitions), skip very small
             if dev_type != "disk":
@@ -711,7 +747,14 @@ def _list_disks_linux():
             if size < 1024**3:
                 continue
 
-            # Prefer removable/USB devices but show all non-boot
+            # SAFETY: only show USB / removable drives
+            is_usb = transport == "usb"
+            is_removable = removable == "1"
+            if not (is_usb or is_removable):
+                continue
+
+            bus_type = (transport.upper() if transport
+                        else ("Removable" if is_removable else "Unknown"))
             device_path = f"/dev/{name}"
 
             disks.append(DiskInfo(
@@ -719,6 +762,7 @@ def _list_disks_linux():
                 model=model.strip(),
                 size_bytes=size,
                 size_display=_format_size(size),
+                bus_type=bus_type,
             ))
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass

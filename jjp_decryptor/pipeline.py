@@ -206,6 +206,61 @@ class DecryptionPipeline:
         if self.cancelled:
             raise PipelineError("Cancelled", "Operation cancelled by user.")
 
+    def _generate_checksums(self, wsl_out):
+        """Generate .checksums.md5 with progress updates."""
+        self.log("Generating checksums for asset tracking...", "info")
+        try:
+            # Count files first, then stream md5sum with a counter so we can
+            # report progress.
+            count_cmd = (
+                f"cd '{wsl_out}' && find . -type f "
+                f"! -name '.*' ! -name 'fl_decrypted.dat' ! -name '*.img' "
+                f"| wc -l"
+            )
+            total = 0
+            try:
+                total = int(self.executor.run(count_cmd, timeout=60).strip())
+            except (CommandError, ValueError):
+                pass
+
+            # Stream md5sum one file at a time — each output line = one file done
+            checksum_cmd = (
+                f"cd '{wsl_out}' && find . -type f "
+                f"! -name '.*' ! -name 'fl_decrypted.dat' ! -name '*.img' "
+                f"-print0 | xargs -0 -n1 md5sum > '.checksums.md5'"
+            )
+            if total > 0:
+                # Use a wrapper that prints a progress counter to stderr
+                # while still writing md5sum output to the file.
+                checksum_cmd = (
+                    f"cd '{wsl_out}' && find . -type f "
+                    f"! -name '.*' ! -name 'fl_decrypted.dat' ! -name '*.img' "
+                    f"-print0 | xargs -0 -n1 md5sum "
+                    f"| awk '{{print >> \".checksums.md5\"; "
+                    f"n++; print \"CKSUM_PROGRESS \" n \" {total}\"}}'"
+                )
+                done = 0
+                for line in self.executor.stream(checksum_cmd, timeout=600):
+                    self._check_cancel()
+                    if line.startswith("CKSUM_PROGRESS "):
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            try:
+                                done = int(parts[1])
+                                t = int(parts[2])
+                                self.on_progress(done, t, f"Checksums: {done}/{t}")
+                            except ValueError:
+                                pass
+            else:
+                self.executor.run(checksum_cmd, timeout=600)
+
+            self.log("Checksums saved to .checksums.md5 in output folder.",
+                     "success")
+        except CommandError:
+            self.log("Warning: Could not generate checksums. "
+                     "Asset modification tracking will not be available.",
+                     "info")
+
     def _log_system_diagnostics(self):
         """Log system/environment info for remote diagnostics."""
         from . import __version__
@@ -1378,17 +1433,7 @@ class DecryptionPipeline:
         self.log(f"Copied {count} files ({size}) to output folder.", "success")
 
         # Generate checksums for future modification comparison
-        self.log("Generating checksums for asset tracking...", "info")
-        try:
-            self.executor.run(
-                f"cd '{wsl_out}' && find . -type f ! -name '.*' ! -name 'fl_decrypted.dat' "
-                f"! -name '*.img' -print0 | xargs -0 md5sum > '.checksums.md5'",
-                timeout=600,
-            )
-            self.log("Checksums saved to .checksums.md5 in output folder.", "success")
-        except CommandError:
-            self.log("Warning: Could not generate checksums. "
-                     "Asset modification tracking will not be available.", "info")
+        self._generate_checksums(wsl_out)
 
         # Move the raw image to the output folder so the mod pipeline can
         # mount it directly from there, and /tmp stays clean.
@@ -1723,6 +1768,8 @@ class ModPipeline(DecryptionPipeline):
             if saved[rel_path] != new_hash:
                 self.changed_files.append((rel_path, full_path))
                 self.log(f"  Modified: {rel_path}", "info")
+                if hasattr(self, '_file_tree_cb'):
+                    self._file_tree_cb(rel_path, "Modified")
 
             if (i + 1) % 500 == 0 or i + 1 == total:
                 self.on_progress(i + 1, total,
@@ -2799,17 +2846,7 @@ class StandaloneDecryptPipeline(DecryptionPipeline):
 
         # Generate checksums for future modification comparison
         wsl_out = self.executor.to_exec_path(self.output_path)
-        self.log("Generating checksums for asset tracking...", "info")
-        try:
-            self.executor.run(
-                f"cd '{wsl_out}' && find . -type f ! -name '.*' ! -name 'fl_decrypted.dat' "
-                f"! -name '*.img' -print0 | xargs -0 md5sum > '.checksums.md5'",
-                timeout=600,
-            )
-            self.log("Checksums saved to .checksums.md5 in output folder.", "success")
-        except CommandError:
-            self.log("Warning: Could not generate checksums. "
-                     "Asset modification tracking will not be available.", "info")
+        self._generate_checksums(wsl_out)
 
     def _phase_cleanup_standalone(self):
         """Simplified cleanup - no daemon or USB to clean up."""
@@ -3175,6 +3212,9 @@ class StandaloneModPipeline(ModPipeline):
                 self.log(f"  Converted (Python): "
                          f"{format_description(repl_fmt)} -> "
                          f"{format_description(orig_fmt)}", "success")
+                if hasattr(self, '_file_tree_cb'):
+                    self._file_tree_cb(rel_path,
+                        f"Converted {format_description(orig_fmt)}")
                 return self._resize_wav_to_duration(
                     converted, orig_fmt, rel_path)
 
@@ -3184,6 +3224,9 @@ class StandaloneModPipeline(ModPipeline):
             self.log(f"  Converted (ffmpeg): "
                      f"{format_description(repl_fmt)} -> "
                      f"{format_description(orig_fmt)}", "success")
+            if hasattr(self, '_file_tree_cb'):
+                self._file_tree_cb(rel_path,
+                    f"Converted {format_description(orig_fmt)}")
             return self._resize_wav_to_duration(
                 converted, orig_fmt, rel_path)
 
@@ -3355,10 +3398,14 @@ class StandaloneModPipeline(ModPipeline):
 
             orig_dur = target_nframes / orig_fmt["framerate"]
             repl_dur = repl_nframes / repl_fmt["framerate"]
-            action = "trimmed" if repl_nframes > target_nframes else "padded"
+            action = "Trimmed" if repl_nframes > target_nframes else "Padded"
+            status = f"{action} {repl_dur:.1f}s -> {orig_dur:.1f}s"
             self.log(
-                f"  Duration {action}: {repl_dur:.2f}s -> {orig_dur:.2f}s "
+                f"  Duration {action.lower()}: {repl_dur:.2f}s -> "
+                f"{orig_dur:.2f}s "
                 f"({len(content)} -> {len(result)} bytes)", "success")
+            if hasattr(self, '_file_tree_cb'):
+                self._file_tree_cb(rel_path, status)
             return result
         except Exception as e:
             self.log(f"  WAV resize failed: {e}", "error")
@@ -3416,6 +3463,9 @@ class StandaloneModPipeline(ModPipeline):
             self.log(f"  Converted (ffmpeg): "
                      f"{ogg_format_description(repl_fmt)} -> "
                      f"{ogg_format_description(orig_fmt)}", "success")
+            if hasattr(self, '_file_tree_cb'):
+                self._file_tree_cb(rel_path,
+                    f"Converted {ogg_format_description(orig_fmt)}")
             if orig_dec_bytes is not None:
                 converted = self._resize_ogg_to_duration(
                     converted, orig_fmt, orig_dec_bytes, rel_path)
@@ -3611,10 +3661,14 @@ class StandaloneModPipeline(ModPipeline):
                         f"base64 '{out_exec}'", timeout=120).strip()
                     result = _b64.b64decode(enc)
 
-            action = "trimmed" if repl_dur > orig_dur else "padded"
+            action = "Trimmed" if repl_dur > orig_dur else "Padded"
+            status = f"{action} {repl_dur:.1f}s -> {orig_dur:.1f}s"
             self.log(
-                f"  OGG duration {action}: {repl_dur:.2f}s -> {orig_dur:.2f}s "
+                f"  OGG duration {action.lower()}: {repl_dur:.2f}s -> "
+                f"{orig_dur:.2f}s "
                 f"({len(content)} -> {len(result)} bytes)", "success")
+            if hasattr(self, '_file_tree_cb'):
+                self._file_tree_cb(rel_path, status)
 
             if len(result) != len(content):
                 self.log(
@@ -3795,6 +3849,8 @@ class StandaloneModPipeline(ModPipeline):
                         continue
 
                 self.log(f"[VERIFY OK] {rel_path}", "success")
+                if hasattr(self, '_file_tree_cb'):
+                    self._file_tree_cb(rel_path, "Encrypted OK")
                 ok += 1
                 # Save expected MD5 + size for the post-write spot-check
                 if not hasattr(self, '_expected_spot'):
@@ -4199,6 +4255,7 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
         self.device_path = device_path  # e.g. \\.\PHYSICALDRIVE2 or /dev/sdb
         self._ssd_mounted = False
         self._wsl_mount_device = None  # for Windows wsl --unmount
+        self._disk_was_offlined = False
 
     def run(self):
         """Execute the direct SSD decrypt pipeline."""
@@ -4260,11 +4317,61 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
             self._wsl_mount_device = device
             self.log(f"Attaching {device} partition {part_num} to WSL...", "info")
 
+            # Clean up stale WSL mounts and Windows drive locks before
+            # attempting wsl --mount.  Order matters:
+            #   1. Try wsl --unmount (specific device) while disk is online
+            #   2. Fallback: wsl --unmount (ALL disks) if specific failed
+            #   3. Take disk offline to release Windows drive letters
+            #   4. wsl --mount
+            disk_num = device.rstrip().replace("\\\\", "\\").split("PHYSICALDRIVE")[-1]
+
+            # Step 1: try to detach specific device from WSL
+            rc_u, _, _ = self.executor.run_host(
+                f'wsl --unmount "{device}"', timeout=15)
+            if rc_u != 0:
+                # Step 2: fallback — unmount ALL WSL-attached disks
+                self.executor.run_host('wsl --unmount', timeout=15)
+
+            # Step 3: take disk offline so Windows releases drive letters
+            if disk_num.isdigit():
+                self.log("Taking disk offline for WSL access...", "info")
+                offline_cmd = (
+                    f'powershell -NoProfile -Command '
+                    f'"Set-Disk -Number {disk_num} -IsOffline $true"'
+                )
+                rc_off, _, err_off = self.executor.run_host(offline_cmd, timeout=15)
+                if rc_off != 0:
+                    self.log(f"Warning: could not take disk offline: {err_off}",
+                             "info")
+                self._disk_was_offlined = True
+            else:
+                self._disk_was_offlined = False
+
             mount_cmd = f'wsl --mount "{device}" --partition {part_num} --type ext4'
             if read_only:
                 mount_cmd += ' --options "ro"'
             rc, stdout, stderr = self.executor.run_host(mount_cmd, timeout=30)
+
+            # If mount failed with "already mounted", try nuclear option:
+            # wsl --shutdown kills the entire WSL VM, clearing all stale mounts
+            if rc != 0 and "ALREADY_MOUNTED" in (stderr or stdout or "").upper():
+                self.log("Stale WSL mount detected — restarting WSL...", "info")
+                self.executor.run_host('wsl --shutdown', timeout=30)
+                # Disk may have come back online after WSL shutdown
+                if disk_num.isdigit():
+                    self.executor.run_host(
+                        f'powershell -NoProfile -Command '
+                        f'"Set-Disk -Number {disk_num} -IsOffline $true"',
+                        timeout=15)
+                rc, stdout, stderr = self.executor.run_host(mount_cmd, timeout=30)
+
             if rc != 0:
+                # Bring disk back online before raising
+                if getattr(self, '_disk_was_offlined', False) and disk_num.isdigit():
+                    self.executor.run_host(
+                        f'powershell -NoProfile -Command '
+                        f'"Set-Disk -Number {disk_num} -IsOffline $false"',
+                        timeout=15)
                 raise PipelineError("Mount",
                     f"Failed to attach SSD to WSL:\n{stderr or stdout}\n\n"
                     "Ensure you are running as Administrator.\n"
@@ -4361,11 +4468,30 @@ class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
                 pass
 
             if isinstance(self.executor, WslExecutor) and self._wsl_mount_device:
-                # Windows: use wsl --unmount from host
+                # Windows: detach disk from WSL so Windows can eject it
+                dev = self._wsl_mount_device
                 rc, stdout, stderr = self.executor.run_host(
-                    f'wsl --unmount "{self._wsl_mount_device}"', timeout=30)
+                    f'wsl --unmount "{dev}"', timeout=30)
                 if rc != 0:
-                    self.log(f"Warning: unmount may have failed: {stderr}", "info")
+                    # Fallback: unmount ALL WSL-attached disks
+                    self.log("Specific unmount failed, unmounting all WSL disks...",
+                             "info")
+                    rc2, _, stderr2 = self.executor.run_host(
+                        'wsl --unmount', timeout=30)
+                    if rc2 != 0:
+                        # Nuclear option: shut down WSL entirely
+                        self.log("Forcing WSL shutdown to release disk...", "info")
+                        self.executor.run_host('wsl --shutdown', timeout=30)
+                # Bring the disk back online so Windows can see it again
+                if getattr(self, '_disk_was_offlined', False):
+                    disk_num = dev.rstrip().replace("\\\\", "\\").split(
+                        "PHYSICALDRIVE")[-1]
+                    if disk_num.isdigit():
+                        self.executor.run_host(
+                            f'powershell -NoProfile -Command '
+                            f'"Set-Disk -Number {disk_num} -IsOffline $false"',
+                            timeout=15)
+                    self._disk_was_offlined = False
             else:
                 # macOS/Linux: unmount inside executor
                 try:
@@ -4445,7 +4571,7 @@ class DirectSSDModPipeline(StandaloneModPipeline):
             self._check_cancel()
 
             self.on_phase(2)  # Encrypt
-            self._phase_encrypt_standalone()
+            self._phase_encrypt_ssd()
             self._check_cancel()
 
             self._succeeded = True
@@ -4469,6 +4595,202 @@ class DirectSSDModPipeline(StandaloneModPipeline):
             self.on_phase(cleanup_phase)
             self._cleanup_ssd()
             self.on_done(False, f"Unexpected error: {e}")
+
+    def _phase_encrypt_ssd(self):
+        """Re-encrypt changed files and write directly to mounted SSD.
+
+        Unlike _phase_encrypt_standalone (which uses debugfs on a raw image),
+        this writes encrypted files directly to the live-mounted ext4
+        filesystem via cp.
+        """
+        import os
+        import re as _re
+        import hashlib as _hl
+        import base64 as _b64
+        from .crypto import encrypt_file, crc32_buf, decrypt_file as _df
+        from .filelist import parse_fl_dat, detect_edata_prefix
+
+        self.log("Loading file list...", "info")
+        entries = parse_fl_dat(self.fl_dat_path)
+        edata_prefix = detect_edata_prefix(entries)
+        entry_map = {e.path: e for e in entries}
+        self.log(f"Loaded {len(entries)} fl.dat entries.", "info")
+
+        mp = self.mount_point  # e.g. /mnt/wsl/PHYSICALDRIVE3p3
+
+        total = len(self.changed_files)
+        ok = 0
+        fail = 0
+
+        # Create a temp staging directory inside WSL
+        tag = uuid.uuid4().hex[:8]
+        staging_dir = f"/var/tmp/jjp_ssd_{tag}"
+        self.executor.run(f"mkdir -p '{staging_dir}'", timeout=10)
+
+        self.on_progress(0, total, "Encrypting...")
+        self.log(f"TOTAL_FILES={total}", "info")
+
+        try:
+            for i, (rel_path, win_path) in enumerate(self.changed_files):
+                self._check_cancel()
+
+                full_path = f"{edata_prefix}{rel_path}"
+                entry = entry_map.get(full_path)
+                if not entry:
+                    self.log(f"[FAIL] {rel_path} (not found in fl.dat)", "error")
+                    fail += 1
+                    continue
+
+                # Read replacement content
+                with open(win_path, 'rb') as f:
+                    content = f.read()
+
+                # Auto-convert audio files if format/duration doesn't match
+                lower = rel_path.lower()
+                if lower.endswith(".wav"):
+                    content = self._maybe_convert_audio(
+                        content, entry, mp, rel_path)
+                elif lower.endswith(".ogg"):
+                    content = self._maybe_convert_ogg(
+                        content, entry, mp, rel_path)
+
+                # Warn if file size differs from original
+                try:
+                    orig_path = f"{mp}{entry.path}"
+                    orig_enc_size = int(self.executor.run(
+                        f"stat -c%s '{orig_path}'", timeout=5).strip())
+                    orig_content_size = orig_enc_size - entry.filler_size - 4
+                    if orig_content_size > 0 and len(content) != orig_content_size:
+                        diff = len(content) - orig_content_size
+                        direction = "larger" if diff > 0 else "smaller"
+                        self.log(
+                            f"  Size: {len(content)} bytes "
+                            f"({abs(diff)} bytes {direction} than "
+                            f"original {orig_content_size})", "info")
+                except Exception:
+                    pass
+
+                self.log(f"Processing: {full_path}", "info")
+                self.log(f"  filler={entry.filler_size} "
+                         f"orig_n2={entry.crc_encrypted} "
+                         f"orig_n3={entry.crc_decrypted}", "info")
+
+                # Encrypt with CRC forgery
+                try:
+                    encrypted = encrypt_file(
+                        content, entry.filler_size, entry.path,
+                        entry.crc_encrypted, entry.crc_decrypted)
+                except Exception as e:
+                    self.log(f"[FAIL] {rel_path}: {e}", "error")
+                    fail += 1
+                    continue
+
+                # Verify CRCs
+                n2 = crc32_buf(encrypted)
+                re_dec = _df(encrypted, entry.filler_size, entry.path)
+                n3 = crc32_buf(re_dec)
+                n2_ok = n2 == entry.crc_encrypted
+                n3_ok = n3 == entry.crc_decrypted
+
+                self.log(f"  n2 forge: want={entry.crc_encrypted} "
+                         f"got={n2} {'OK' if n2_ok else 'FAIL'}", "info")
+                self.log(f"  n3 forge: want={entry.crc_decrypted} "
+                         f"got={n3} {'OK' if n3_ok else 'FAIL'}", "info")
+
+                if not (n2_ok and n3_ok):
+                    self.log(f"[VERIFY FAIL] {rel_path}", "error")
+                    fail += 1
+                    continue
+
+                # Stage encrypted file, then cp to mounted SSD
+                enc_b64 = _b64.b64encode(encrypted).decode()
+                staging = f"{staging_dir}/enc_{i:05d}.bin"
+                expected_size = len(encrypted)
+                dest_path = f"{mp}{entry.path}"
+
+                try:
+                    # Write encrypted bytes to staging file in WSL
+                    if len(enc_b64) > 100000:
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(
+                            mode='w', suffix='.b64', delete=False,
+                            dir=os.environ.get('TEMP',
+                                               os.environ.get('TMP', '.')),
+                        ) as tf:
+                            tf.write(enc_b64)
+                            tmp_win = tf.name
+                        wsl_tmp = self.executor.to_exec_path(tmp_win)
+                        try:
+                            self.executor.run(
+                                f"base64 -d '{wsl_tmp}' > '{staging}'",
+                                timeout=60)
+                        finally:
+                            os.unlink(tmp_win)
+                    else:
+                        self.executor.run(
+                            f"echo '{enc_b64}' | base64 -d > '{staging}'",
+                            timeout=30)
+
+                    # Verify staging file size
+                    actual_size = int(self.executor.run(
+                        f"stat -c%s '{staging}'", timeout=5).strip())
+                    if actual_size != expected_size:
+                        self.log(
+                            f"[FAIL] {rel_path} (staging size mismatch: "
+                            f"expected {expected_size}, got {actual_size})",
+                            "error")
+                        fail += 1
+                        continue
+
+                    # Copy encrypted file to mounted SSD filesystem
+                    self.executor.run(
+                        f"cp '{staging}' '{dest_path}'", timeout=120)
+
+                    # Verify written file size
+                    disk_size = int(self.executor.run(
+                        f"stat -c%s '{dest_path}'", timeout=5).strip())
+                    if disk_size != expected_size:
+                        self.log(
+                            f"[FAIL] {rel_path} (written size mismatch: "
+                            f"expected {expected_size}, got {disk_size})",
+                            "error")
+                        fail += 1
+                        continue
+
+                    self.log(f"[VERIFY OK] {rel_path}", "success")
+                    if hasattr(self, '_file_tree_cb'):
+                        self._file_tree_cb(rel_path, "Encrypted OK")
+                    ok += 1
+                except (CommandError, OSError) as e:
+                    self.log(f"[FAIL] {rel_path} (write failed: {e})", "error")
+                    fail += 1
+
+                self.on_progress(i + 1, total, f"ok={ok} fail={fail}")
+
+        finally:
+            # Clean up staging directory
+            try:
+                self.executor.run(f"rm -rf '{staging_dir}'", timeout=30)
+            except Exception:
+                pass
+
+        # Sync to ensure all writes hit the disk
+        try:
+            self.executor.run("sync", timeout=30)
+        except Exception:
+            pass
+
+        self.on_progress(total, total, "Complete")
+        summary = f"{ok}/{total} files replaced and verified"
+        if fail > 0:
+            summary += f" ({fail} FAILED)"
+            self.log(summary, "error")
+        else:
+            summary += " successfully"
+            self.log(summary, "success")
+
+        self.log("CRC32 forgery: encrypted files match original fl.dat checksums.",
+                 "success")
 
     # Reuse mount/unmount from DirectSSDDecryptPipeline
     _mount_ssd = DirectSSDDecryptPipeline._mount_ssd
