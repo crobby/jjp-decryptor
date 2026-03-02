@@ -4171,6 +4171,437 @@ class StandaloneModPipeline(ModPipeline):
         self.log("Cleanup complete.", "success")
 
 
+# ==================================================================
+# Direct SSD pipelines — modify files on a physically-connected SSD
+# ==================================================================
+
+class DirectSSDDecryptPipeline(StandaloneDecryptPipeline):
+    """Decrypt files directly from a physically-connected JJP game SSD.
+
+    Skips the ISO extract phase entirely — mounts the SSD's ext4 partition
+    directly via WSL (Windows), Docker (macOS), or native mount (Linux).
+
+    Phases: Mount → Decrypt → Cleanup
+    """
+
+    def __init__(self, device_path, output_path, fl_dat_path,
+                 log_cb, phase_cb, progress_cb, done_cb):
+        # Pass device_path as image_path (we override mount logic)
+        super().__init__(device_path, output_path, fl_dat_path,
+                         log_cb, phase_cb, progress_cb, done_cb)
+        self.device_path = device_path  # e.g. \\.\PHYSICALDRIVE2 or /dev/sdb
+        self._ssd_mounted = False
+        self._wsl_mount_device = None  # for Windows wsl --unmount
+
+    def run(self):
+        """Execute the direct SSD decrypt pipeline."""
+        from .executor import DockerExecutor
+        cleanup_phase = len(config.DIRECT_SSD_PHASES) - 1
+        try:
+            self._log_system_diagnostics()
+            self.log(f"Direct SSD mode — device: {self.device_path}", "info")
+
+            # Verify output path is accessible
+            ok, msg = self.executor.check_path_accessible(self.output_path)
+            if not ok:
+                raise PipelineError("Mount", f"Output folder path error:\n{msg}")
+
+            # Start Docker container if on macOS
+            if isinstance(self.executor, DockerExecutor):
+                self.log("Starting Docker container...", "info")
+                self.executor.start_container([
+                    self.output_path, *_project_dirs()])
+
+            self.on_phase(0)  # Mount
+            self._mount_ssd(read_only=True)
+            self._check_cancel()
+
+            # Detect game name from the mount
+            self._detect_game()
+
+            self.on_phase(1)  # Decrypt
+            self._phase_decrypt_standalone()
+            self._check_cancel()
+
+            self._succeeded = True
+            self.on_phase(cleanup_phase)  # Cleanup
+            self._cleanup_ssd()
+            self.on_done(True, f"Decryption complete! Files saved to:\n{self.output_path}")
+
+        except PipelineError as e:
+            self.log(str(e), "error")
+            self.on_phase(cleanup_phase)
+            self._cleanup_ssd()
+            self.on_done(False, str(e))
+        except Exception as e:
+            self.log(f"Unexpected error: {e}", "error")
+            self.on_phase(cleanup_phase)
+            self._cleanup_ssd()
+            self.on_done(False, f"Unexpected error: {e}")
+
+    def _mount_ssd(self, read_only=True):
+        """Mount the SSD's game partition via platform-specific method."""
+        from .executor import WslExecutor, DockerExecutor, NativeExecutor
+        part_num = config.GAME_PARTITION_NUMBER
+
+        tag = uuid.uuid4().hex[:8]
+        self.mount_point = f"{config.MOUNT_PREFIX}ssd_{tag}"
+
+        if isinstance(self.executor, WslExecutor):
+            # Windows: use wsl --mount from the host side
+            device = self.device_path  # e.g. \\.\PHYSICALDRIVE2
+            self._wsl_mount_device = device
+            self.log(f"Attaching {device} partition {part_num} to WSL...", "info")
+
+            mount_cmd = f'wsl --mount "{device}" --partition {part_num} --type ext4'
+            if read_only:
+                mount_cmd += ' --options "ro"'
+            rc, stdout, stderr = self.executor.run_host(mount_cmd, timeout=30)
+            if rc != 0:
+                raise PipelineError("Mount",
+                    f"Failed to attach SSD to WSL:\n{stderr or stdout}\n\n"
+                    "Ensure you are running as Administrator.\n"
+                    "Note: wsl --mount may not support USB-connected drives "
+                    "on some systems. Try a direct SATA connection.")
+
+            # Find the mount point — wsl --mount puts it at /mnt/wsl/<diskname>
+            # The exact path depends on the device name
+            try:
+                result = self.executor.run(
+                    "findmnt -rn -o TARGET -t ext4 | grep -v '/mnt/c'",
+                    timeout=10)
+                # Find the most recently added mount
+                mounts = [m.strip() for m in result.strip().split("\n") if m.strip()]
+                if mounts:
+                    self.mount_point = mounts[-1]
+                    self._ssd_mounted = True
+                    self.log(f"SSD mounted at {self.mount_point}", "success")
+                else:
+                    raise PipelineError("Mount",
+                        "SSD was attached but mount point not found in WSL.")
+            except CommandError as e:
+                raise PipelineError("Mount",
+                    f"Could not find SSD mount point: {e.output}") from e
+
+        elif isinstance(self.executor, DockerExecutor):
+            # macOS: SSD must be unmounted from macOS, then accessed in Docker
+            device = self.device_path  # e.g. /dev/disk2
+            self.log(f"Preparing {device} for Docker access...", "info")
+
+            # Unmount from macOS first
+            rc, stdout, stderr = self.executor.run_host(
+                f"diskutil unmountDisk {device}", timeout=15)
+            if rc != 0:
+                self.log(f"Warning: could not unmount {device}: {stderr}", "info")
+
+            # Mount partition inside container
+            # Docker needs the device passed through; the container is already
+            # started with --privileged so it can see /dev/ devices
+            dev_partition = f"{device}s{part_num}"
+            mount_opts = "ro" if read_only else "rw"
+            try:
+                self.executor.run(f"mkdir -p {self.mount_point}", timeout=10)
+                self.executor.run(
+                    f"mount -t ext4 -o {mount_opts} '{dev_partition}' "
+                    f"{self.mount_point}",
+                    timeout=config.MOUNT_TIMEOUT)
+                self._ssd_mounted = True
+                self.log(f"SSD mounted at {self.mount_point}", "success")
+            except CommandError as e:
+                raise PipelineError("Mount",
+                    f"Failed to mount SSD in Docker:\n{e.output}") from e
+
+        elif isinstance(self.executor, NativeExecutor):
+            # Linux: direct mount
+            device = self.device_path  # e.g. /dev/sdb
+            dev_partition = f"{device}{part_num}"
+            mount_opts = "ro" if read_only else "rw"
+            self.log(f"Mounting {dev_partition} ({mount_opts})...", "info")
+            try:
+                self.executor.run(f"mkdir -p {self.mount_point}", timeout=10)
+                self.executor.run(
+                    f"mount -t ext4 -o {mount_opts} '{dev_partition}' "
+                    f"{self.mount_point}",
+                    timeout=config.MOUNT_TIMEOUT)
+                self._ssd_mounted = True
+                self.log(f"SSD mounted at {self.mount_point}", "success")
+            except CommandError as e:
+                raise PipelineError("Mount",
+                    f"Failed to mount SSD:\n{e.output}") from e
+
+        # Validate this looks like a JJP game partition
+        try:
+            self.executor.run(
+                f"test -d '{self.mount_point}{config.GAME_BASE_PATH}'",
+                timeout=10)
+        except CommandError:
+            raise PipelineError("Mount",
+                f"This doesn't look like a JJP game drive.\n"
+                f"Expected {config.GAME_BASE_PATH} not found on partition "
+                f"{part_num}.\n\n"
+                "Make sure you selected the correct drive.")
+
+    def _cleanup_ssd(self):
+        """Unmount the SSD and clean up."""
+        self.log("Cleaning up...", "info")
+        from .executor import WslExecutor, DockerExecutor
+
+        if self._ssd_mounted:
+            try:
+                # Sync before unmount
+                self.executor.run("sync", timeout=30)
+            except CommandError:
+                pass
+
+            if isinstance(self.executor, WslExecutor) and self._wsl_mount_device:
+                # Windows: use wsl --unmount from host
+                rc, stdout, stderr = self.executor.run_host(
+                    f'wsl --unmount "{self._wsl_mount_device}"', timeout=30)
+                if rc != 0:
+                    self.log(f"Warning: unmount may have failed: {stderr}", "info")
+            else:
+                # macOS/Linux: unmount inside executor
+                try:
+                    self.executor.run(
+                        f"umount '{self.mount_point}' 2>/dev/null; true",
+                        timeout=30)
+                except CommandError:
+                    pass
+                try:
+                    self.executor.run(
+                        f"rmdir '{self.mount_point}' 2>/dev/null; true",
+                        timeout=5)
+                except CommandError:
+                    pass
+
+            self._ssd_mounted = False
+
+        # Stop Docker container if applicable
+        if isinstance(self.executor, DockerExecutor):
+            try:
+                self.executor.stop_container()
+            except Exception:
+                pass
+
+        self.log("Cleanup complete.", "success")
+
+
+class DirectSSDModPipeline(StandaloneModPipeline):
+    """Modify files directly on a physically-connected JJP game SSD.
+
+    Skips the ISO extract, convert, and build phases. Writes encrypted
+    files directly to the SSD's ext4 partition.
+
+    Phases: Scan → Mount → Encrypt → Cleanup
+    """
+
+    def __init__(self, device_path, assets_folder, fl_dat_path,
+                 log_cb, phase_cb, progress_cb, done_cb):
+        super().__init__(device_path, assets_folder, fl_dat_path,
+                         log_cb, phase_cb, progress_cb, done_cb)
+        self.device_path = device_path
+        self._ssd_mounted = False
+        self._wsl_mount_device = None
+
+    def run(self):
+        """Execute the direct SSD mod pipeline."""
+        from .executor import DockerExecutor
+        cleanup_phase = len(config.DIRECT_SSD_MOD_PHASES) - 1
+        try:
+            self._log_system_diagnostics()
+            self.log(f"Direct SSD mod mode — device: {self.device_path}", "info")
+
+            # Verify assets folder is accessible
+            ok, msg = self.executor.check_path_accessible(self.assets_folder)
+            if not ok:
+                raise PipelineError("Scan", f"Assets folder path error:\n{msg}")
+
+            # Start Docker container if on macOS
+            if isinstance(self.executor, DockerExecutor):
+                self.log("Starting Docker container...", "info")
+                self.executor.start_container([
+                    self.assets_folder, *_project_dirs()])
+
+            self.on_phase(0)  # Scan
+            self._phase_scan()
+            self._check_cancel()
+
+            if not self.changed_files:
+                self.on_done(True,
+                    "No changes detected in the assets folder.\n"
+                    "Modify files in the output folder and try again.")
+                return
+
+            self.on_phase(1)  # Mount
+            # Reuse DirectSSDDecryptPipeline's mount logic
+            self._mount_ssd(read_only=False)
+            self._check_cancel()
+
+            self.on_phase(2)  # Encrypt
+            self._phase_encrypt_standalone()
+            self._check_cancel()
+
+            self._succeeded = True
+            self.on_phase(cleanup_phase)  # Cleanup
+            self._cleanup_ssd()
+
+            self.on_done(True,
+                "Asset modification complete!\n\n"
+                "The SSD has been updated directly. You can now:\n"
+                "1. Safely eject the drive\n"
+                "2. Install it back in the pinball machine\n"
+                "3. Power on — no USB flashing needed!")
+
+        except PipelineError as e:
+            self.log(str(e), "error")
+            self.on_phase(cleanup_phase)
+            self._cleanup_ssd()
+            self.on_done(False, str(e))
+        except Exception as e:
+            self.log(f"Unexpected error: {e}", "error")
+            self.on_phase(cleanup_phase)
+            self._cleanup_ssd()
+            self.on_done(False, f"Unexpected error: {e}")
+
+    # Reuse mount/unmount from DirectSSDDecryptPipeline
+    _mount_ssd = DirectSSDDecryptPipeline._mount_ssd
+    _cleanup_ssd = DirectSSDDecryptPipeline._cleanup_ssd
+
+
+def export_mod_pack(assets_folder, output_zip, log_cb=None, progress_cb=None):
+    """Scan assets folder for modified files and package them into a zip.
+
+    The zip contains:
+    - Only files that differ from the baseline .checksums.md5
+    - fl_decrypted.dat (needed for CRC forgery when applying the pack)
+    - .checksums.md5 (so the recipient can apply further mods on top)
+
+    Returns (num_changed, zip_path) on success, raises PipelineError on failure.
+    """
+    import hashlib
+    import os
+    import re
+    import zipfile
+
+    def log(msg, level="info"):
+        if log_cb:
+            log_cb(msg, level)
+
+    checksums_file = os.path.join(assets_folder, '.checksums.md5')
+    if not os.path.isfile(checksums_file):
+        raise PipelineError("Export",
+            "No .checksums.md5 found in the assets folder.\n"
+            "Run Decrypt first to generate baseline checksums.")
+
+    fl_dat_path = os.path.join(assets_folder, 'fl_decrypted.dat')
+    if not os.path.isfile(fl_dat_path):
+        raise PipelineError("Export",
+            "No fl_decrypted.dat found in the assets folder.\n"
+            "Run Decrypt first to generate the file list.")
+
+    # Load saved checksums
+    saved = {}
+    with open(checksums_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            m = re.match(r'^([a-f0-9]{32})\s+\*?(.+)$', line)
+            if m:
+                filepath = m.group(2)
+                if filepath.startswith('./'):
+                    filepath = filepath[2:]
+                saved[filepath] = m.group(1)
+
+    log(f"Loaded {len(saved)} baseline checksums.", "info")
+
+    # Collect files to scan
+    all_files = []
+    for root, _dirs, files in os.walk(assets_folder):
+        for name in files:
+            if name.startswith('.') or name == 'fl_decrypted.dat' or name.endswith('.img'):
+                continue
+            full_path = os.path.join(root, name)
+            rel_path = os.path.relpath(full_path, assets_folder).replace('\\', '/')
+            if rel_path in saved:
+                all_files.append((rel_path, full_path))
+
+    total = len(all_files)
+    log(f"Checking {total} files for changes...", "info")
+
+    changed = []
+    for i, (rel_path, full_path) in enumerate(all_files):
+        h = hashlib.md5()
+        with open(full_path, 'rb') as fh:
+            for chunk in iter(lambda: fh.read(65536), b''):
+                h.update(chunk)
+        if saved[rel_path] != h.hexdigest():
+            changed.append((rel_path, full_path))
+            log(f"  Modified: {rel_path}", "info")
+        if progress_cb and ((i + 1) % 500 == 0 or i + 1 == total):
+            progress_cb(i + 1, total, f"{len(changed)} changed so far")
+
+    if not changed:
+        raise PipelineError("Export",
+            "No modified files detected.\n"
+            "Modify files in the output folder first, then export.")
+
+    log(f"Found {len(changed)} modified file(s). Creating mod pack...", "info")
+
+    with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # Add changed files
+        for rel_path, full_path in changed:
+            zf.write(full_path, rel_path)
+
+        # Include fl_decrypted.dat and checksums for the recipient
+        zf.write(fl_dat_path, 'fl_decrypted.dat')
+        zf.write(checksums_file, '.checksums.md5')
+
+    zip_size = os.path.getsize(output_zip)
+    size_mb = zip_size / (1024 * 1024)
+    log(f"Mod pack saved: {output_zip} ({size_mb:.1f} MB, "
+        f"{len(changed)} file(s))", "success")
+
+    return len(changed), output_zip
+
+
+def import_mod_pack(zip_path, assets_folder, log_cb=None, progress_cb=None):
+    """Extract a mod pack ZIP into the assets folder.
+
+    Overwrites files in assets_folder with the contents of the zip.
+    Returns the number of files extracted.
+    """
+    import os
+    import zipfile
+
+    def log(msg, level="info"):
+        if log_cb:
+            log_cb(msg, level)
+
+    if not os.path.isfile(zip_path):
+        raise PipelineError("Import", f"Mod pack not found: {zip_path}")
+
+    if not os.path.isdir(assets_folder):
+        raise PipelineError("Import",
+            f"Output folder does not exist:\n{assets_folder}")
+
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        members = [m for m in zf.namelist() if not m.endswith('/')]
+        total = len(members)
+        if total == 0:
+            raise PipelineError("Import", "Mod pack is empty.")
+
+        log(f"Extracting {total} file(s) from mod pack...", "info")
+
+        for i, name in enumerate(members):
+            zf.extract(name, assets_folder)
+            if progress_cb and ((i + 1) % 100 == 0 or i + 1 == total):
+                progress_cb(i + 1, total, name)
+
+    log(f"Imported {total} file(s) into {assets_folder}", "success")
+    return total
+
+
 def check_prerequisites(executor, standalone=False):
     """Check all prerequisites. Returns list of (name, passed, message) tuples."""
     import sys as _sys
