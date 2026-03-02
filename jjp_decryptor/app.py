@@ -255,6 +255,19 @@ class App:
 
     def _install_prereqs_wsl(self):
         """Install all WSL prerequisites and prompt for restart."""
+        # Check if WSL2 itself is working first
+        wsl_ok = False
+        try:
+            self.executor.run("echo ok", timeout=15)
+            wsl_ok = True
+        except Exception:
+            pass
+
+        if not wsl_ok:
+            # WSL2 isn't available — launch the PowerShell installer script
+            self._launch_prereqs_script()
+            return
+
         self.window.append_log("Installing prerequisites in WSL...", "info")
         self.window.install_btn.configure(state=tk.DISABLED)
 
@@ -290,6 +303,62 @@ class App:
                     "Some prerequisites are still missing.", "error"))
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _launch_prereqs_script(self):
+        """Launch the PowerShell prerequisite installer for WSL2 setup."""
+        import subprocess
+
+        # Look for install_prerequisites.ps1 in common locations
+        candidates = [
+            # Installed via Inno Setup (same dir as app)
+            os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "install_prerequisites.ps1"),
+            # Development layout
+            os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "installer",
+                "install_prerequisites.ps1"),
+        ]
+
+        script_path = None
+        for path in candidates:
+            if os.path.isfile(path):
+                script_path = path
+                break
+
+        if script_path:
+            self.window.append_log(
+                "WSL2 is not available. Launching prerequisite installer...",
+                "info")
+            try:
+                subprocess.Popen(
+                    ["powershell.exe", "-NoProfile", "-ExecutionPolicy",
+                     "Bypass", "-File", script_path],
+                    creationflags=subprocess.CREATE_NEW_CONSOLE)
+                self.window.append_log(
+                    "Prerequisite installer opened in a new window. "
+                    "After it completes, restart this app and click Check.",
+                    "info")
+            except Exception as e:
+                self.window.append_log(
+                    f"Failed to launch installer: {e}", "error")
+        else:
+            # Script not found — show manual instructions
+            self.window.append_log(
+                "WSL2 is not available. To install manually:", "error")
+            self.window.append_log(
+                "  1. Open PowerShell as Administrator", "info")
+            self.window.append_log(
+                "  2. Run: wsl --install -d Ubuntu", "info")
+            self.window.append_log(
+                "  3. Restart your computer", "info")
+            self.window.append_log(
+                "  4. Re-open this app and click Install Missing", "info")
+            messagebox.showinfo(
+                "WSL2 Not Installed",
+                "WSL2 is required but not installed.\n\n"
+                "Open PowerShell as Administrator and run:\n"
+                "  wsl --install -d Ubuntu\n\n"
+                "Then restart your computer and re-open this app.")
 
     def _install_prereqs_native(self):
         """Install all prerequisites on native Linux."""

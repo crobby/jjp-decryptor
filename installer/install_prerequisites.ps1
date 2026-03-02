@@ -16,19 +16,31 @@
     anything that is already present.
 
 .NOTES
-    Must be run as Administrator (required for WSL installation).
+    Automatically elevates to Administrator if needed.
     May require a reboot if WSL2 was not previously enabled.
+    Supports Windows 10 (version 1903+) and Windows 11.
 #>
 
-# --- Require admin ---
+# --- Self-elevate to admin if needed ---
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host "This script must be run as Administrator." -ForegroundColor Red
-    Write-Host "Right-click and select 'Run as administrator', or run from an elevated PowerShell." -ForegroundColor Red
-    Write-Host ""
-    Read-Host "Press Enter to exit"
-    exit 1
+    Write-Host "Requesting Administrator privileges..." -ForegroundColor Yellow
+    try {
+        Start-Process powershell.exe -Verb RunAs -ArgumentList (
+            "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+        )
+    } catch {
+        Write-Host "Failed to elevate to Administrator." -ForegroundColor Red
+        Write-Host "Please right-click and select 'Run as administrator'." -ForegroundColor Red
+        Write-Host ""
+        Read-Host "Press Enter to exit"
+    }
+    exit 0
 }
+
+Write-Host "JJP Asset Decryptor — Prerequisite Installer" -ForegroundColor Cyan
+Write-Host "Running as Administrator" -ForegroundColor Green
+Write-Host ""
 
 $ErrorActionPreference = "Continue"
 $needsReboot = $false
@@ -59,29 +71,55 @@ function Write-SKIP($msg) {
 }
 
 # ============================================================
+# 0. Check Windows version
+# ============================================================
+$osBuild = [System.Environment]::OSVersion.Version.Build
+Write-Host "Windows Build: $osBuild" -ForegroundColor Gray
+
+# ============================================================
 # 1. WSL2
 # ============================================================
 Write-Step "Checking WSL2..."
 
 $wslAvailable = $false
-try {
-    $wslStatus = wsl --status 2>&1 | Out-String
-    if ($LASTEXITCODE -eq 0) {
-        $wslAvailable = $true
-        Write-OK "WSL2"
-    }
-} catch {}
+$wslCmdExists = $null -ne (Get-Command wsl -ErrorAction SilentlyContinue)
+
+if ($wslCmdExists) {
+    try {
+        $wslStatus = wsl --status 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0) {
+            $wslAvailable = $true
+            Write-OK "WSL2"
+        }
+    } catch {}
+}
 
 if (-not $wslAvailable) {
     Write-Host "  WSL2 is not installed or not enabled." -ForegroundColor Yellow
-    $install = Read-Host "  Install WSL2 with Ubuntu now? (y/n)"
-    if ($install -eq 'y') {
+
+    if ($wslCmdExists -and $osBuild -ge 19041) {
+        # Modern approach: wsl --install (Windows 10 2004+ / Windows 11)
         Write-Host "  Installing WSL2 with Ubuntu (this may take several minutes)..." -ForegroundColor Cyan
         wsl --install -d Ubuntu 2>&1 | ForEach-Object { Write-Host "    $_" }
         $needsReboot = $true
         Write-Installed "WSL2 + Ubuntu (reboot required)"
     } else {
-        Write-SKIP "WSL2"
+        # Fallback for older Windows 10 builds: enable features via DISM
+        Write-Host "  Using manual installation method for this Windows version..." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Enabling Windows Subsystem for Linux..." -ForegroundColor Cyan
+        dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart 2>&1 | ForEach-Object { Write-Host "    $_" }
+        Write-Host ""
+        Write-Host "  Enabling Virtual Machine Platform..." -ForegroundColor Cyan
+        dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart 2>&1 | ForEach-Object { Write-Host "    $_" }
+        $needsReboot = $true
+        Write-Host ""
+        Write-Host "  After rebooting, you will need to:" -ForegroundColor Yellow
+        Write-Host "    1. Open PowerShell as Administrator" -ForegroundColor Yellow
+        Write-Host "    2. Run: wsl --set-default-version 2" -ForegroundColor Yellow
+        Write-Host "    3. Install Ubuntu from the Microsoft Store" -ForegroundColor Yellow
+        Write-Host "    4. Re-run this script to install the remaining tools" -ForegroundColor Yellow
+        Write-Installed "WSL features enabled (reboot required)"
     }
 }
 
@@ -104,18 +142,13 @@ if ($wslAvailable) {
 if (-not $ubuntuFound -and -not $needsReboot) {
     if ($wslAvailable) {
         Write-Host "  No Ubuntu distribution found in WSL." -ForegroundColor Yellow
-        $install = Read-Host "  Install Ubuntu now? (y/n)"
-        if ($install -eq 'y') {
-            Write-Host "  Installing Ubuntu (this may take several minutes)..." -ForegroundColor Cyan
-            wsl --install -d Ubuntu 2>&1 | ForEach-Object { Write-Host "    $_" }
-            if ($LASTEXITCODE -eq 0) {
-                $ubuntuFound = $true
-                Write-Installed "Ubuntu"
-            } else {
-                Write-FAIL "Ubuntu (installation failed)"
-            }
+        Write-Host "  Installing Ubuntu (this may take several minutes)..." -ForegroundColor Cyan
+        wsl --install -d Ubuntu 2>&1 | ForEach-Object { Write-Host "    $_" }
+        if ($LASTEXITCODE -eq 0) {
+            $ubuntuFound = $true
+            Write-Installed "Ubuntu"
         } else {
-            Write-SKIP "Ubuntu"
+            Write-FAIL "Ubuntu (installation failed)"
         }
     } else {
         Write-SKIP "Ubuntu (WSL2 not available yet — install after reboot)"
@@ -125,7 +158,15 @@ if (-not $ubuntuFound -and -not $needsReboot) {
 }
 
 # ============================================================
-# 3. partclone in WSL
+# 3. Update apt before installing tools
+# ============================================================
+if ($wslAvailable -and $ubuntuFound) {
+    Write-Step "Updating package lists..."
+    wsl -u root -- bash -c "apt-get update -qq" 2>&1 | ForEach-Object { Write-Host "    $_" }
+}
+
+# ============================================================
+# 4. partclone in WSL
 # ============================================================
 Write-Step "Checking partclone in WSL..."
 
@@ -141,7 +182,7 @@ if ($wslAvailable -and $ubuntuFound) {
 
     if (-not $pcFound) {
         Write-Host "  Installing partclone..." -ForegroundColor Cyan
-        wsl -u root -- bash -c "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq partclone" 2>&1 | ForEach-Object { Write-Host "    $_" }
+        wsl -u root -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq partclone" 2>&1 | ForEach-Object { Write-Host "    $_" }
         try {
             wsl -u root -- which partclone.ext4 2>&1 | Out-Null
             if ($LASTEXITCODE -eq 0) {
@@ -158,7 +199,7 @@ if ($wslAvailable -and $ubuntuFound) {
 }
 
 # ============================================================
-# 4. xorriso in WSL
+# 5. xorriso in WSL
 # ============================================================
 Write-Step "Checking xorriso in WSL..."
 
@@ -191,7 +232,7 @@ if ($wslAvailable -and $ubuntuFound) {
 }
 
 # ============================================================
-# 5. debugfs (e2fsprogs) in WSL
+# 6. debugfs (e2fsprogs) in WSL
 # ============================================================
 Write-Step "Checking debugfs in WSL..."
 
@@ -224,7 +265,7 @@ if ($wslAvailable -and $ubuntuFound) {
 }
 
 # ============================================================
-# 6. pigz in WSL
+# 7. pigz in WSL
 # ============================================================
 Write-Step "Checking pigz in WSL..."
 
@@ -257,7 +298,7 @@ if ($wslAvailable -and $ubuntuFound) {
 }
 
 # ============================================================
-# 7. ffmpeg in WSL
+# 8. ffmpeg in WSL
 # ============================================================
 Write-Step "Checking ffmpeg in WSL..."
 

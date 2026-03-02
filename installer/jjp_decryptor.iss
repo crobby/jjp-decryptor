@@ -43,7 +43,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"
-Name: "runprereqs"; Description: "Install prerequisites after setup (WSL2, partclone, xorriso, debugfs, pigz, ffmpeg)"; GroupDescription: "Prerequisites:"; Flags: checkedonce
+Name: "runprereqs"; Description: "Install prerequisites after setup (WSL2, partclone, xorriso, debugfs, pigz, ffmpeg)"; GroupDescription: "Prerequisites:"; Flags: checked
 
 [Files]
 ; Bundled Python with tkinter
@@ -88,7 +88,7 @@ Name: "{autodesktop}\JJP Asset Decryptor"; Filename: "wscript.exe"; Parameters: 
 
 [Run]
 ; Run prerequisites installer if the user checked the box
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install_prerequisites.ps1"""; WorkingDir: "{app}"; StatusMsg: "Installing prerequisites..."; Flags: runascurrentuser shellexec waituntilterminated; Tasks: runprereqs
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install_prerequisites.ps1"""; WorkingDir: "{app}"; StatusMsg: "Installing prerequisites..."; Flags: shellexec waituntilterminated; Tasks: runprereqs
 
 ; Offer to launch the app after install
 Filename: "wscript.exe"; Parameters: """{app}\launcher.vbs"""; WorkingDir: "{app}"; Description: "Launch JJP Asset Decryptor"; Flags: nowait postinstall skipifsilent
