@@ -3,6 +3,7 @@
 import json
 import os
 import queue
+import shutil
 import threading
 import tkinter as tk
 from tkinter import messagebox
@@ -30,6 +31,36 @@ else:
                                   os.path.expanduser("~/.config")),
                                   "jjp_decryptor")
 _SETTINGS_FILE = os.path.join(_SETTINGS_DIR, "settings.json")
+
+
+def _detect_native_linux_pkg_manager():
+    """Return the local Linux package manager command, if supported."""
+    for cmd in ("zypper", "apt-get", "apt"):
+        if shutil.which(cmd):
+            return cmd
+    return None
+
+
+def _native_prereq_install_cmd():
+    """Return a non-interactive install command for Linux prerequisites."""
+    pkgs = "partclone xorriso e2fsprogs pigz ffmpeg"
+    pm = _detect_native_linux_pkg_manager()
+    if pm == "zypper":
+        return (
+            "zypper --non-interactive refresh && "
+            f"zypper --non-interactive install --no-confirm {pkgs} 2>&1"
+        )
+    if pm == "apt-get":
+        return (
+            "apt-get update -qq && "
+            f"DEBIAN_FRONTEND=noninteractive apt-get install -y {pkgs} 2>&1"
+        )
+    if pm == "apt":
+        return (
+            "apt update -qq && "
+            f"DEBIAN_FRONTEND=noninteractive apt install -y {pkgs} 2>&1"
+        )
+    return None
 
 
 # Message types for the thread-safe queue
@@ -367,9 +398,16 @@ class App:
 
         def _run():
             try:
+                install_cmd = _native_prereq_install_cmd()
+                if not install_cmd:
+                    self.msg_queue.put(LogMsg(
+                        "No supported package manager found for automatic install. "
+                        "Install partclone, xorriso, e2fsprogs, pigz, and ffmpeg manually.",
+                        "error",
+                    ))
+                    return
                 for line in self.executor.stream(
-                    "apt-get update -qq && "
-                    "apt-get install -y partclone xorriso e2fsprogs pigz ffmpeg 2>&1",
+                    install_cmd,
                     timeout=300,
                 ):
                     self.msg_queue.put(LogMsg(f"  {line}", "info"))

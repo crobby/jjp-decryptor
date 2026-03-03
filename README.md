@@ -46,11 +46,10 @@ No USB dongle, gcc, or usbipd-win required. No additional Python packages needed
 - **balenaEtcher** (for writing modified ISOs to USB): [etcher.balena.io](https://etcher.balena.io/)
 
 ### Linux
-- **partclone**: `sudo apt install partclone`
-- **xorriso**: `sudo apt install xorriso`
-- **e2fsprogs** (provides `debugfs`): `sudo apt install e2fsprogs`
-- **pigz**: `sudo apt install pigz`
-- **ffmpeg**: `sudo apt install ffmpeg`
+- Ubuntu/Debian:
+  `sudo apt install partclone xorriso e2fsprogs pigz ffmpeg`
+- openSUSE Tumbleweed:
+  `sudo zypper install partclone xorriso e2fsprogs pigz ffmpeg`
 - Requires `sudo` for the decrypt pipeline (loop-mounting ext4 images for read-only access)
 - **dd** or **balenaEtcher** for writing modified ISOs to USB
 

@@ -3,6 +3,7 @@
 import base64
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -10,7 +11,10 @@ import uuid
 
 from . import config
 from .resources import DECRYPT_C_SOURCE, ENCRYPT_C_SOURCE, STUB_C_SOURCE
-from .executor import CommandError, create_executor, find_usbipd
+from .executor import (
+    CommandError, create_executor, find_usbipd,
+    WslExecutor, NativeExecutor, DockerExecutor,
+)
 
 
 def _find_project_file(filename):
@@ -48,6 +52,78 @@ def _stage_project_file(filename, cache_dir):
         dst = os.path.join(cache_dir, filename)
         shutil.copy2(src, dst)
     return f"/tmp/{filename}"
+
+
+def _detect_native_linux_pkg_manager():
+    """Return the native Linux package manager command, if supported."""
+    for cmd in ("zypper", "apt-get", "apt"):
+        if shutil.which(cmd):
+            return cmd
+    return None
+
+
+def _manual_install_command(executor, package):
+    """Return a human-friendly install command for a single package."""
+    if isinstance(executor, WslExecutor):
+        return f"wsl -u root -- apt install {package}"
+    if isinstance(executor, NativeExecutor):
+        pm = _detect_native_linux_pkg_manager()
+        if pm == "zypper":
+            return f"sudo zypper install {package}"
+        if pm == "apt-get":
+            return f"sudo apt-get install {package}"
+        if pm == "apt":
+            return f"sudo apt install {package}"
+        return f"Install {package} with your distro package manager"
+    return f"Install {package}"
+
+
+def _auto_install_command(executor, packages):
+    """Return a non-interactive install command for the active executor."""
+    pkg_list = " ".join(packages)
+    if isinstance(executor, WslExecutor):
+        return (
+            "apt-get update -qq && "
+            f"DEBIAN_FRONTEND=noninteractive apt-get install -y {pkg_list} 2>&1"
+        )
+    if isinstance(executor, DockerExecutor):
+        return f"apk add --no-cache {pkg_list} 2>&1"
+    if isinstance(executor, NativeExecutor):
+        pm = _detect_native_linux_pkg_manager()
+        if pm == "zypper":
+            return (
+                "zypper --non-interactive refresh && "
+                f"zypper --non-interactive install --no-confirm {pkg_list} 2>&1"
+            )
+        if pm == "apt-get":
+            return (
+                "apt-get update -qq && "
+                f"DEBIAN_FRONTEND=noninteractive apt-get install -y {pkg_list} 2>&1"
+            )
+        if pm == "apt":
+            return (
+                "apt update -qq && "
+                f"DEBIAN_FRONTEND=noninteractive apt install -y {pkg_list} 2>&1"
+            )
+    return None
+
+
+def _reinstall_iso_tools_hint(executor):
+    """Return a reinstall command hint for xorriso/partclone issues."""
+    if isinstance(executor, WslExecutor):
+        return (
+            "wsl -u root -- apt update && "
+            "wsl -u root -- apt install --reinstall xorriso partclone"
+        )
+    if isinstance(executor, NativeExecutor):
+        pm = _detect_native_linux_pkg_manager()
+        if pm == "zypper":
+            return "sudo zypper refresh && sudo zypper install --force xorriso partclone"
+        if pm == "apt-get":
+            return "sudo apt-get update && sudo apt-get install --reinstall xorriso partclone"
+        if pm == "apt":
+            return "sudo apt update && sudo apt install --reinstall xorriso partclone"
+    return "Reinstall xorriso and partclone with your distro package manager"
 
 
 # Python script deployed to WSL for standalone decryption.
@@ -536,12 +612,11 @@ class DecryptionPipeline:
             if not has_partclone:
                 self.log("Installing partclone (one-time setup)...", "info")
                 try:
-                    self.executor.run(
-                        "DEBIAN_FRONTEND=noninteractive apt-get install -y partclone 2>&1",
-                        timeout=120,
-                    )
-                    has_partclone = True
-                    self.log("partclone installed.", "success")
+                    install_cmd = _auto_install_command(self.executor, ["partclone"])
+                    if install_cmd:
+                        self.executor.run(install_cmd, timeout=180)
+                        has_partclone = True
+                        self.log("partclone installed.", "success")
                 except CommandError:
                     pass
 
@@ -551,7 +626,7 @@ class DecryptionPipeline:
                 raise PipelineError("Extract",
                     "No extraction method available.\n"
                     "Ensure partclone_to_raw.py is in the project directory, or\n"
-                    "install partclone: wsl -u root -- apt install partclone")
+                    f"install partclone: {_manual_install_command(self.executor, 'partclone')}")
 
         # Verify the output
         try:
@@ -2305,15 +2380,19 @@ class ModPipeline(DecryptionPipeline):
             except CommandError:
                 self.log(f"  {tool} not found. Installing {pkg}...", "info")
                 try:
-                    self.executor.run(
-                        f"DEBIAN_FRONTEND=noninteractive apt-get install -y {pkg} 2>&1",
-                        timeout=120,
-                    )
+                    install_cmd = _auto_install_command(self.executor, [pkg])
+                    if not install_cmd:
+                        raise PipelineError(
+                            "Convert",
+                            f"Cannot auto-install {pkg} on this platform.\n"
+                            f"Run manually: {_manual_install_command(self.executor, pkg)}",
+                        )
+                    self.executor.run(install_cmd, timeout=180)
                     self.log(f"  {pkg} installed.", "success")
                 except CommandError as e:
                     raise PipelineError("Convert",
                         f"Failed to install {pkg}: {e.output}\n"
-                        f"Run manually: wsl -u root -- apt install {pkg}") from e
+                        f"Run manually: {_manual_install_command(self.executor, pkg)}") from e
 
         # Log tool versions for diagnostics
         for ver_cmd, label in [
@@ -2518,10 +2597,8 @@ class ModPipeline(DecryptionPipeline):
                     "error")
                 self.log(
                     "To fix this, try the following:\n"
-                    "  1. Run:  wsl -u root -- apt update && "
-                    "wsl -u root -- apt install --reinstall xorriso partclone\n"
-                    "  2. Run:  wsl --shutdown  (in a Windows terminal)\n"
-                    "  3. Re-run Apply Modifications\n"
+                    f"  1. Run:  {_reinstall_iso_tools_hint(self.executor)}\n"
+                    "  2. Re-run Apply Modifications\n"
                     "If the problem persists, please share your full log.",
                     "error")
             else:
@@ -3273,14 +3350,15 @@ class StandaloneModPipeline(ModPipeline):
 
         self.log("Installing ffmpeg for audio conversion...", "info")
         try:
-            from .executor import DockerExecutor
-            if isinstance(self.executor, DockerExecutor):
-                self.executor.run(
-                    "apk add --no-cache ffmpeg 2>&1", timeout=120)
-            else:
-                self.executor.run(
-                    "DEBIAN_FRONTEND=noninteractive "
-                    "apt-get install -y ffmpeg 2>&1", timeout=120)
+            install_cmd = _auto_install_command(self.executor, ["ffmpeg"])
+            if not install_cmd:
+                self.log(
+                    "Warning: no supported package manager found for automatic ffmpeg install.",
+                    "error",
+                )
+                self._ffmpeg_available = False
+                return False
+            self.executor.run(install_cmd, timeout=180)
             self._ffmpeg_available = True
             self.log("ffmpeg installed.", "success")
             return True
@@ -4933,8 +5011,6 @@ def import_mod_pack(zip_path, assets_folder, log_cb=None, progress_cb=None):
 
 def check_prerequisites(executor, standalone=False):
     """Check all prerequisites. Returns list of (name, passed, message) tuples."""
-    import sys as _sys
-    from .executor import WslExecutor, NativeExecutor, DockerExecutor
 
     results = []
 
@@ -5013,34 +5089,34 @@ def check_prerequisites(executor, standalone=False):
             results.append(("partclone", True, "Available"))
         except Exception:
             results.append(("partclone", False,
-                "Not installed. Run: sudo apt install partclone"))
+                f"Not installed. Run: {_manual_install_command(executor, 'partclone')}"))
 
         try:
             executor.run("which xorriso", timeout=10)
             results.append(("xorriso", True, "Available"))
         except Exception:
             results.append(("xorriso", False,
-                "Not installed. Run: sudo apt install xorriso"))
+                f"Not installed. Run: {_manual_install_command(executor, 'xorriso')}"))
 
         try:
             executor.run("which debugfs", timeout=10)
             results.append(("debugfs", True, "Available"))
         except Exception:
             results.append(("debugfs", False,
-                "Not installed. Run: sudo apt install e2fsprogs"))
+                f"Not installed. Run: {_manual_install_command(executor, 'e2fsprogs')}"))
 
         try:
             executor.run("which pigz", timeout=10)
             results.append(("pigz", True, "Available"))
         except Exception:
             results.append(("pigz", False,
-                "Not installed. Run: sudo apt install pigz"))
+                f"Not installed. Run: {_manual_install_command(executor, 'pigz')}"))
 
         try:
             executor.run("which ffmpeg", timeout=10)
             results.append(("ffmpeg", True, "Available"))
         except Exception:
             results.append(("ffmpeg", False,
-                "Not installed. Run: sudo apt install ffmpeg"))
+                f"Not installed. Run: {_manual_install_command(executor, 'ffmpeg')}"))
 
     return results
